@@ -66,6 +66,7 @@ if (enableObservability) {
     },
     a365: {
       enabled: true,
+      enableObservabilityExporter: true,
       tokenResolver: (agentId: string, tenantId: string) =>
         AgenticTokenCacheInstance.getObservabilityToken(agentId, tenantId) ?? '',
     },
