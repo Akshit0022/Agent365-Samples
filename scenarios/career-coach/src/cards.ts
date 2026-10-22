@@ -21,12 +21,12 @@ export type CardPayload =
   | { type: 'welcome'; greeting: string; tagline?: string; capabilities?: { icon: string; title: string; desc: string }[]; prompt: string }
   | { type: 'skillPath'; roleTitle: string; intro?: string; skills: SkillPathSkill[]; footer?: string; interactive?: boolean; readOnly?: boolean }
   | { type: 'gapAnalysis'; roleTitle: string; skills: { name: string; target: number; current: number; gap: number; status: Status }[]; goals?: string[]; footer?: string }
-  | { type: 'planReview'; roleTitle: string; intro?: string; skills: PlanReviewSkill[]; totalCourses?: number; footer?: string }
+  | { type: 'planReview'; roleTitle: string; intro?: string; skills: PlanReviewSkill[]; totalCourses?: number; footer?: string; saved?: boolean }
   | { type: 'courses'; intro?: string; groups: { skill: string; courses: { title: string; provider?: string; format?: string; url?: string }[] }[]; footer?: string }
   | { type: 'progress'; roleTitle?: string; overall?: number; goals: { name: string; progressPct: number; status?: string }[]; learning?: { title: string; skill?: string; status?: string }[]; footer?: string }
   | { type: 'roadmap'; roleTitle: string; stages: { label: string; detail?: string; state?: 'done' | 'current' | 'todo' }[]; footer?: string }
   | { type: 'prepBrief'; roleTitle?: string; overall?: number; goals?: { name: string; progressPct: number; status?: string }[]; managerAsks?: string; wins: { title: string; star: string }[]; talkingPoints: string[]; questions: string[]; footer?: string }
-  | { type: 'quiz'; courseId: string; courseTitle: string; skillId?: string; skillName?: string; intro?: string; questions: QuizQuestion[]; footer?: string }
+  | { type: 'quiz'; courseId: string; courseTitle: string; skillId?: string; skillName?: string; intro?: string; questions: QuizQuestion[]; footer?: string; readOnly?: boolean; answers?: Record<string, string> }
   | { type: 'quizResult'; courseTitle: string; skillName?: string; score: number; total: number; passed: boolean; feedback: QuizFeedback[]; footer?: string }
   | { type: 'milestone80'; roleTitle?: string; overall: number; stillToClose: { name: string; progressPct: number }[]; areasToStrengthen: string[]; footer?: string }
   | { type: 'completionSummary'; roleTitle?: string; managerName?: string; managerEmail?: string; userEmail?: string; totalTimeMinutes?: number; coursesCompleted?: number; subject?: string; sent: boolean; note?: string; footer?: string };
@@ -276,7 +276,8 @@ function buildSkillPath(p: Extract<CardPayload, { type: 'skillPath' }>) {
           // Default to '0' (Not started). Teams' compact ChoiceSet on Action.Execute
           // sometimes drops values the user picked but never touched; a default
           // guarantees SOMETHING is always submitted, so the flow never dead-ends.
-          value: '0',
+          // When the card is restored after a failed submit, the user's earlier pick is kept.
+          value: String(s.currentLevel ?? 0),
           placeholder: 'Pick 0–4 (default 0)',
           choices: ratingChoices,
         }],
@@ -454,6 +455,12 @@ function buildPlanReview(p: Extract<CardPayload, { type: 'planReview' }>) {
       spacing: 'Medium',
       isSubtle: true,
     });
+  }
+
+  if (p.saved) {
+    // Saved variant: same plan, no Save button, so it can't be saved again from this card.
+    body.push({ type: 'TextBlock', text: '✅ Plan saved — your progress is shown below.', color: 'Good', weight: 'Bolder', wrap: true, spacing: 'Medium' });
+    return AC(body);
   }
 
   if (p.footer) body.push(sub(p.footer));
@@ -642,6 +649,8 @@ function buildQuiz(p: Extract<CardPayload, { type: 'quiz' }>) {
   const heading = p.skillName ? `📝 Quick check — ${p.courseTitle}` : `📝 Quick check — ${p.courseTitle}`;
   const introText = p.intro
     || `Answer 5 short questions to lock in what you learned${p.skillName ? ` in ${p.skillName}` : ''}. You'll advance when you get 4 out of 5.`;
+  const readOnly = !!p.readOnly;
+  const answers = p.answers ?? {};
   const body: any[] = [header(heading), sub(introText)];
 
   p.questions.forEach((q, i) => {
@@ -654,12 +663,34 @@ function buildQuiz(p: Extract<CardPayload, { type: 'quiz' }>) {
     // making all questions look identically numbered. "Q1." is unambiguously a label and
     // renders correctly as literal "Q1.", "Q2.", "Q3.", "Q4.", "Q5.".
     body.push({ type: 'TextBlock', text: `Q${qNum}. ${cleaned}`, weight: 'Bolder', wrap: true, spacing: 'Medium' });
-    if (q.type === 'mcq' && q.choices && q.choices.length) {
+    if (readOnly) {
+      // Submitted variant: no inputs, just the user's picks so the card can't be edited/resubmitted.
+      const picked = String(answers[q.id] ?? '').trim();
+      if (q.type === 'mcq' && q.choices && q.choices.length) {
+        q.choices.forEach((label, idx) => {
+          const selected = picked.toUpperCase() === String.fromCharCode(65 + idx);
+          body.push({
+            type: 'TextBlock', wrap: true, spacing: 'None',
+            text: `${selected ? '●' : '○'} ${label}`,
+            weight: selected ? 'Bolder' : 'Default',
+            isSubtle: !selected,
+          });
+        });
+        if (!picked) body.push({ type: 'TextBlock', text: '_(no answer)_', isSubtle: true, wrap: true, spacing: 'None' });
+      } else {
+        body.push({
+          type: 'Container', style: 'emphasis', spacing: 'Small',
+          items: [{ type: 'TextBlock', text: picked || '_(no answer)_', wrap: true, isSubtle: !picked }],
+        });
+      }
+    } else if (q.type === 'mcq' && q.choices && q.choices.length) {
       body.push({
         type: 'Input.ChoiceSet',
         id: q.id,
         style: 'expanded',
         isMultiSelect: false,
+        // Pre-filled when the card is restored after a failed submit.
+        ...(answers[q.id] ? { value: String(answers[q.id]) } : {}),
         choices: q.choices.map((label, idx) => ({
           title: label,
           value: String.fromCharCode(65 + idx), // 'A', 'B', 'C', 'D'
@@ -671,9 +702,15 @@ function buildQuiz(p: Extract<CardPayload, { type: 'quiz' }>) {
         id: q.id,
         placeholder: 'Type your answer (1–2 sentences)…',
         isMultiline: true,
+        ...(answers[q.id] ? { value: String(answers[q.id]) } : {}),
       });
     }
   });
+
+  if (readOnly) {
+    body.push({ type: 'TextBlock', text: '✅ Answers submitted — see your results below.', color: 'Good', weight: 'Bolder', wrap: true, spacing: 'Medium' });
+    return AC(body);
+  }
 
   if (p.footer) body.push(sub(p.footer));
 
@@ -684,6 +721,7 @@ function buildQuiz(p: Extract<CardPayload, { type: 'quiz' }>) {
     verb: 'careercoach_quiz_submit',
     data: {
       courseId: p.courseId,
+      courseTitle: p.courseTitle,
       skillId: p.skillId,
       // Include the question metadata so the handler can round-trip it back into the LLM turn
       // for grading — the LLM authored these questions and knows the correct answers.
@@ -878,9 +916,15 @@ export function buildMessageCard(text: string): Attachment {
  * Splits an LLM response into leading prose + Adaptive Card attachments.
  * Recognizes fenced ```card blocks whose body is a JSON CardPayload.
  * On any parse error the block is left as-is in the text (never dropped).
+ * Payloads whose type is listed in `options.deferTypes` are stripped and returned in
+ * `deferred` instead of being rendered, so the caller can produce them deterministically.
  */
-export function extractCards(response: string): { text: string; attachments: Attachment[] } {
+export function extractCards(
+  response: string,
+  options: { deferTypes?: CardPayload['type'][] } = {},
+): { text: string; attachments: Attachment[]; deferred: CardPayload[] } {
   const attachments: Attachment[] = [];
+  const deferred: CardPayload[] = [];
   const fence = /```card\s*([\s\S]*?)```/gi;
   let text = response;
   let m: RegExpExecArray | null;
@@ -890,6 +934,11 @@ export function extractCards(response: string): { text: string; attachments: Att
     const raw = m[1].trim();
     try {
       const payload = JSON.parse(raw) as CardPayload;
+      if (options.deferTypes?.includes(payload.type)) {
+        deferred.push(payload);
+        toStrip.push(m[0]);
+        continue;
+      }
       const card = buildCard(payload);
       if (card) {
         attachments.push(CardFactory.adaptiveCard(card));
@@ -900,5 +949,5 @@ export function extractCards(response: string): { text: string; attachments: Att
     }
   }
   for (const block of toStrip) text = text.replace(block, '');
-  return { text: text.trim(), attachments };
+  return { text: text.trim(), attachments, deferred };
 }

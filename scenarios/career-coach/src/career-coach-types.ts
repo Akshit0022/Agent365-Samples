@@ -103,6 +103,32 @@ export interface UserState {
   LastSyncDate?: string;
   Milestone80Fired?: boolean;
   Completion100Fired?: boolean;
+  // Goal lifecycle — one UserState row per goal; only the Active one is worked on.
+  PlanStatus?: PlanStatus;
+  PlanCompletedDate?: string;
+}
+
+/**
+ * Active = the goal being worked on (at most one per user). Completed = reached 100% and
+ * the completion email went out. Replaced = the user saved a new goal before finishing this one.
+ */
+export type PlanStatus = 'Active' | 'Completed' | 'Replaced';
+
+/** App-managed lifecycle columns — never written by the LLM. */
+export const PLAN_LIFECYCLE_FIELDS = ['PlanStatus', 'PlanCompletedDate', 'Completion100Fired'] as const;
+
+/**
+ * Status of a UserState row (display-name fields). Rows saved before the lifecycle columns
+ * existed have no PlanStatus: they count as Completed once Completion100Fired is set.
+ */
+export function planStatusOf(fields: Record<string, any> | null | undefined): PlanStatus {
+  const raw = String(fields?.PlanStatus ?? '').trim().toLowerCase();
+  if (raw === 'completed') return 'Completed';
+  if (raw === 'replaced') return 'Replaced';
+  if (raw === 'active') return 'Active';
+  const fired = fields?.Completion100Fired;
+  const done = fired === true || ['true', 'yes', '1'].includes(String(fired ?? '').toLowerCase());
+  return done ? 'Completed' : 'Active';
 }
 
 // --- LearningPortalStatus (mimic'd learning-portal source, populated in the backend) ---

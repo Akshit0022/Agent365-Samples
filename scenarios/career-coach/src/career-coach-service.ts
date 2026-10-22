@@ -24,7 +24,7 @@ import {
     SP_CONFIG,
     CompetencyFrameworkRow, LearningCatalogRow,
     UserState, UserGoal, UserSkill, UserLearningRecord, UserLearningQuizSummary,
-    LearningPortalStatusRow,
+    LearningPortalStatusRow, planStatusOf,
 } from './career-coach-types';
 import { getColumnMap, toDisplayFields, toInternalFields } from './sharepoint-column-map';
 import { getSiteId, getListIdByName } from './graph-service';
@@ -66,20 +66,34 @@ export async function readLearningCatalog(graph: MsGraphClient, siteId?: string)
 
 export interface UserStateRecord { itemId: string; siteId: string; listId: string; state: UserState }
 
-/** Reads the UserState row for one user. Returns null if the user has no plan yet. */
+/**
+ * Reads the user's ACTIVE goal (UserState row). Completed / replaced goals are ignored, so
+ * null means "no active goal" — a new user, or one whose last goal is done.
+ */
 export async function readUserState(graph: MsGraphClient, userAADId: string, siteId?: string): Promise<UserStateRecord | null> {
+    const rows = await readUserRows(graph, userAADId, siteId);
+    // Newest first, in case an older row was left Active (e.g. before the lifecycle columns existed).
+    const row = rows.rows.filter((r) => planStatusOf(r.fields) === 'Active').sort((a, b) => Number(b.id) - Number(a.id))[0];
+    if (!row) return null;
+    return { itemId: row.id, siteId: rows.site, listId: rows.listId, state: hydrateUserState(row.fields) };
+}
+
+/** The user's finished goals (Completed or Replaced), most recent first. */
+export async function readPreviousPlans(graph: MsGraphClient, userAADId: string, siteId?: string): Promise<UserStateRecord[]> {
+    const rows = await readUserRows(graph, userAADId, siteId);
+    return rows.rows
+        .filter((r) => planStatusOf(r.fields) !== 'Active')
+        .sort((a, b) => Number(b.id) - Number(a.id))
+        .map((r) => ({ itemId: r.id, siteId: rows.site, listId: rows.listId, state: hydrateUserState(r.fields) }));
+}
+
+async function readUserRows(graph: MsGraphClient, userAADId: string, siteId?: string) {
     const site = siteId ?? await getSiteId();
     const listId = await getListIdByName(site, SP_CONFIG.lists.userState);
     if (!listId) throw new Error(`List not found: ${SP_CONFIG.lists.userState}`);
     const items = await pagedItems(graph, site, listId);
-    const row = items.find((r) => String(r.fields?.UserAADId ?? '').toLowerCase() === userAADId.toLowerCase());
-    if (!row) return null;
-    return {
-        itemId: row.id,
-        siteId: site,
-        listId,
-        state: hydrateUserState(row.fields),
-    };
+    const rows = items.filter((r) => String(r.fields?.UserAADId ?? '').toLowerCase() === userAADId.toLowerCase());
+    return { site, listId, rows };
 }
 
 export async function readLearningPortalStatus(graph: MsGraphClient, userAADId: string, siteId?: string): Promise<LearningPortalStatusRow[]> {
@@ -119,6 +133,8 @@ function hydrateUserState(fields: any): UserState {
         LastSyncDate: fields.LastSyncDate ?? undefined,
         Milestone80Fired: normBool(fields.Milestone80Fired),
         Completion100Fired: normBool(fields.Completion100Fired),
+        PlanStatus: planStatusOf(fields),
+        PlanCompletedDate: fields.PlanCompletedDate || undefined,
     };
 }
 
@@ -153,7 +169,29 @@ function serializeUserState(state: UserState): Record<string, unknown> {
         LastSyncDate: state.LastSyncDate ?? '',
         Milestone80Fired: !!state.Milestone80Fired,
         Completion100Fired: !!state.Completion100Fired,
+        PlanStatus: state.PlanStatus ?? 'Active',
+        PlanCompletedDate: state.PlanCompletedDate ?? '',
     };
+}
+
+let warnedMissingLifecycle = false;
+
+/**
+ * Drops the goal-lifecycle columns when the list doesn't have them yet (setup:sharepoint not
+ * re-run), so writes keep working. Without them, a goal counts as done once Completion100Fired is set.
+ */
+export function dropMissingLifecycleColumns(fields: Record<string, unknown>, colMap: Awaited<ReturnType<typeof getColumnMap>>): Record<string, unknown> {
+    const out = { ...fields };
+    for (const name of ['PlanStatus', 'PlanCompletedDate']) {
+        if (name in out && !colMap.displayToInternal[name] && !colMap.internalToDisplay[name]) {
+            delete out[name];
+            if (!warnedMissingLifecycle) {
+                warnedMissingLifecycle = true;
+                console.warn(`[UserState] Column "${name}" is missing on ${SP_CONFIG.lists.userState} — run "npm run setup:sharepoint" to add the goal-lifecycle columns.`);
+            }
+        }
+    }
+    return out;
 }
 
 // ============================================================================
@@ -165,7 +203,7 @@ export async function upsertUserState(graph: MsGraphClient, state: UserState, ex
     const listId = existing?.listId ?? await getListIdByName(site, SP_CONFIG.lists.userState);
     if (!listId) throw new Error(`List not found: ${SP_CONFIG.lists.userState}`);
     const colMap = await getColumnMap(graph, site, listId);
-    const displayFields = serializeUserState(state);
+    const displayFields = dropMissingLifecycleColumns(serializeUserState(state), colMap);
     const internal = toInternalFields(displayFields, colMap);
     if (existing?.itemId) {
         await graph.api(`/sites/${site}/lists/${listId}/items/${existing.itemId}/fields`).update(internal);

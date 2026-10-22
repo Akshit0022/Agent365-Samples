@@ -1,188 +1,202 @@
-<!-- Copyright (c) Microsoft Corporation. Licensed under the MIT License. -->
+# Career Coach autopilot — Design
 
-# Career Coach — Design
+How the agent is designed and why. For a line-by-line tour of the code see [`AGENT-CODE-WALKTHROUGH.md`](../AGENT-CODE-WALKTHROUGH.md); for setup and testing see [`README.md`](../README.md).
 
-A private AI **Career Coach** built on the Microsoft Agent 365 SDK + OpenAI Agents SDK. It helps an employee set a target role, maps their skill gaps against a competency framework, recommends courses, proactively quizzes them as they complete learning, fires milestone nudges, and drafts a manager wrap-up email — all as Adaptive Card conversations inside Microsoft Teams.
+## 1. Purpose and scope
 
-## 1. Design principles
+A private career coach for employees, delivered as a Microsoft **Agent 365 AI Teammate**. It helps a person:
 
-1. **Deterministic-first.** The LLM is gated to only the paths that genuinely need language understanding: free-text role elicitation, quiz-question generation, short-answer grading, and completion-email prose. Every card submit, data write, MCQ grade, milestone rule, and email dispatch is plain TypeScript. This eliminates hallucinated skill bumps, wrong goal completion, and long invoke timeouts.
-2. **Card actions never double-fire.** Every `Action.Execute` handler acknowledges fast; heavy work runs after the ack.
-3. **Durable state in SharePoint.** Five lists hold all state; a disk-backed store keeps proactive conversation references across restarts.
-4. **One path to Graph.** Runtime uses agentic auth (a delegated Graph token minted per turn — `/me` is whoever is in the chat). Setup/seed scripts use MSAL device-code + delegated scopes. No application-permission client secret at runtime.
-5. **Grounded, not hallucinated.** All plan/progress state is read back from SharePoint before each write; the LLM never invents list IDs or progress values.
-6. **Graceful degradation.** A365 lifecycle events are consumed by a top-priority route so onboarding never crashes the turn.
+1. pick a target role,
+2. self-assess against that role's skills,
+3. get a gap analysis and a course plan from a curated catalog,
+4. save the plan as a **goal**,
+5. learn, prove each course with a short quiz, and see progress,
+6. get a milestone summary at 80% and a completion email to their manager at 100%,
+7. prepare for a 1:1 with their manager,
+8. start a new goal and keep the history of earlier ones.
 
-## 2. Architecture
+It works in **Teams** and **email**, shares one data model across both, and reports telemetry to Agent 365 (Defender / admin-center Activity).
 
-```mermaid
-flowchart LR
-    subgraph Teams["Microsoft Teams"]
-        User["👤 Employee"]
-    end
+Out of scope: acting for anyone but the signed-in user, writing to the reference lists, and handling quizzes by email.
 
-    subgraph Coach["Career Coach (A365 SDK)"]
-        Router["🚦 Card & Message Router<br/>agent.ts"]
-        Code["⚙️ Deterministic TypeScript<br/>handlers.ts · career-coach-service.ts<br/>Save · Sync · Grade MCQ · Milestones · Email"]
-        LLM["🧠 Focused LLM Calls<br/>llm-tasks.ts + client.ts<br/>Role elicit · Quiz gen · Short-answer grade · Email prose"]
-    end
+## 2. Design principles
 
-    subgraph M365["Microsoft 365"]
-        SP["📁 SharePoint Lists<br/>UserState · LearningCatalog · Quiz · Portal · Competency"]
-        Graph["📧 Microsoft Graph<br/>/me/manager · sendMail · Change Subscriptions"]
-    end
-
-    Portal["🎓 Learning Portal"] -->|logs course completions| SP
-    User <-->|adaptive cards<br/>welcome · skill path · plan · quiz · progress| Router
-    Router --> Code
-    Router --> LLM
-    LLM --> Code
-    Code <--> SP
-    Code <--> Graph
-    SP -.->|change notification via webhook| Router
-    Graph -.->|email to user + manager on 100%| User
-
-    classDef code fill:#e8f4fd,stroke:#2b6cb0,color:#111;
-    classDef llm fill:#fef3c7,stroke:#b45309,color:#111;
-    classDef data fill:#e6f7ea,stroke:#2f855a,color:#111;
-    class Code code;
-    class LLM llm;
-    class SP,Graph,Portal data;
-```
-
-**Hybrid pro-code:** the LLM handles free-text conversation and creative generation only; the deterministic TypeScript path owns every card submit, data write, business rule, and email.
-
-## 3. User journey
-
-```mermaid
-flowchart LR
-    A["👤 Employee<br/>opens Teams"] --> B["🎯 Set goal<br/>pick target role"]
-    B --> C["📊 Rate skills<br/>0 → 4 on each dimension"]
-    C --> D["💾 Save plan<br/>courses + goals in SharePoint"]
-    D --> E["📚 Learn<br/>take courses on learning portal"]
-    E --> F["📝 Auto-quiz<br/>coach DMs a 5-question quiz on completion"]
-    F -->|Pass ≥ 4/5| G["🚀 Skill level bumps<br/>progress recomputes"]
-    F -->|Fail| F2["Retry quiz"]
-    F2 --> F
-    G -->|≥ 80% overall| H["🏆 Milestone card<br/>weak topics surfaced"]
-    G -->|100% overall| I["🎉 Email to manager<br/>courses + hours invested"]
-
-    classDef start fill:#e0e7ff,stroke:#3730a3,color:#111;
-    classDef win fill:#dcfce7,stroke:#166534,color:#111;
-    class A start;
-    class H,I win;
-```
-
-## 4. Source layout
-
-```
-src/
-├── index.ts                  Express server: /api/messages, /api/portal-event, /api/health
-├── agent.ts                  MyAgent (AgentApplication) — message/notification/install routing +
-│                             Action.Execute handlers (welcome, skill_ratings, save_plan, quiz_submit)
-├── client.ts                 OpenAI Agents client + system prompt + observability wiring (LLM path)
-├── cards.ts                  All Adaptive Card renderers + renderCard()/extractCards()
-├── handlers.ts               Deterministic card handlers: skill ratings, save plan, quiz submit, sync
-├── career-coach-service.ts   Pure business logic + typed SharePoint CRUD (gap analysis, grading,
-│                             milestones, progress recompute)
-├── career-coach-types.ts     Shared interfaces + SP_CONFIG
-├── llm-tasks.ts              3 focused LLM sub-calls: quiz generation, short-answer grade, email prose
-├── graph-service.ts          MSAL device-code + agentic Graph clients, sendMail, subscriptions
-├── sharepoint-tools.ts       OpenAI function tools for the LLM path (agentic Graph, auto-correction)
-├── sharepoint-column-map.ts  Display-name ↔ internal-name column translation
-├── quiz-cache.ts             In-memory quiz answer-key store
-├── file-storage.ts           Disk-backed Storage impl for the Proactive subsystem
-├── proactive-refs.ts         AAD Object ID → conversation reference cache
-├── subscription-manager.ts   Auto-create + auto-renew the Graph change subscription
-├── openai-config.ts          Azure OpenAI vs OpenAI client selection
-├── token-cache.ts            Observability token cache helpers
-└── scripts/                  Setup, seed, and demo helpers (see README §9)
-```
-
-## 5. The five flows
-
-Each flow is a deterministic handler in `handlers.ts`, backed by pure logic in `career-coach-service.ts`, with focused LLM sub-calls in `llm-tasks.ts`.
-
-| Flow | Trigger | Key code |
+| # | Principle | What it means in practice |
 |---|---|---|
-| **Set goals + skill path** | `careercoach_welcome` tile → role name | `buildSkillPathForRole`, `findRole` |
-| **Map skills + save plan** | `careercoach_skill_ratings` → `careercoach_save_plan` | `handleSkillRatingsSubmit`, `handleSavePlanSubmit`, `matchCoursesForSkill`, `gapCategoryFor` |
-| **Proactive quiz** | Graph change notification → `/api/portal-event` | `handleSyncProgress`, `generateQuizQuestions`, `handleQuizSubmit`, `gradeMcqAnswer`, `gradeShortAnswers` |
-| **80% milestone** | recompute after a quiz pass | `recomputeGoalsAndOverall`, `computeMilestoneAggregate` |
-| **100% completion + email** | all goals reach 100% | `composeCompletionEmail`, `sendMail` (Graph `/me/sendMail`) |
+| 1 | **The LLM talks; code decides.** | The model handles conversation and text. Saving, grading, progress maths, emails and status changes are deterministic TypeScript |
+| 2 | **Rules are enforced, not requested.** | Tool-level guards reject disallowed writes; prompts only explain them. A model mistake can't corrupt data |
+| 3 | **One source of truth.** | State lives in SharePoint lists. Teams and email read and write the same rows; there is no per-channel copy of a goal |
+| 4 | **Never go silent.** | Every background step either completes or tells the user what failed and how to retry |
+| 5 | **Degrade, don't die.** | Optional capabilities (Mail/Calendar tools, telemetry, the webhook) can fail without stopping a conversation |
+| 6 | **Least privilege.** | The agent acts as its own agentic user; WorkIQ SharePoint is read-only; email goes only to the requesting user (and their manager only on request or on completion) |
 
-### Feature 1 — portal → proactive quiz (sequence)
+## 3. Architecture
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Emp as 👤 Employee
-    participant Portal as 🎓 Learning Portal
-    participant SP as 📁 SharePoint
-    participant Graph as 📧 Microsoft Graph
-    participant Coach as 🚦 Career Coach
-    participant LLM as 🧠 LLM (Q gen)
+```
+            Teams                          Email to the agent's mailbox
+              │ (Bot/Agent activity)         │ (A365 email notification)
+              ▼                              ▼
+        POST /api/messages  ──►  CloudAdapter ──► MyAgent (agent.ts)
+                                                   │
+      ┌──────────────┬──────────────┬──────────────┼──────────────┬─────────────────┐
+      │ Card actions │ Typed-message│ LLM path     │ Email handler│ Proactive       │
+      │ (buttons)    │ shortcuts    │ (client.ts)  │              │ (portal event)  │
+      └──────┬───────┴──────┬───────┴──────┬───────┴──────┬───────┴────────┬────────┘
+             ▼              ▼              ▼              ▼                ▼
+        handlers.ts  ◄── career-coach-service.ts (pure rules) ──►  sharepoint-tools.ts (guards)
+             │                                                          │
+             └──────────────► Microsoft Graph (agentic user) ◄──────────┘
+                                   │
+                     SharePoint lists (state)   ·   Mail (completion email)
 
-    Emp->>Portal: Completes a course
-    Portal->>SP: Writes row to LearningPortalStatus
-    SP->>Graph: Change notification (subscribed list)
-    Graph->>Coach: POST /api/portal-event
-    Coach->>SP: Read UserState + LearningPortalStatus
-    Note over Coach: Diff finds newly-completed course
-    Coach->>LLM: Generate 5 quiz questions for that course
-    LLM-->>Coach: Questions + correct answers
-    Coach->>Emp: Proactive DM with quiz card
-    Emp->>Coach: Submits answers
-    Coach->>Coach: Grade MCQ (code) + short-answer (LLM)
-    Coach->>SP: Append QuizResponses + update UserState
-    Coach->>Emp: Quiz result + progress card
+   LLM path also uses ► WorkIQ MCP (Mail, Calendar, SharePoint read-only)  ·  Azure OpenAI
+
+   Every path is wrapped by telemetry (invoke_agent / chat / execute_tool) ► Agent 365 exporter (S2S route)
+
+   SharePoint LearningPortalStatus change ► Graph subscription ► POST /api/portal-event ► Proactive DM
 ```
 
-### Course state lifecycle
+**Why a hybrid and not a pure agent?** A pure LLM agent hallucinated skill bumps, marked courses complete without evidence, double-saved plans, and exceeded Teams' 10-second card-action limit. Moving every write and rule into code removes those failure classes and makes behaviour testable; the model is kept for what it is good at (understanding intent, writing text, authoring quiz questions).
 
-```mermaid
-stateDiagram-v2
-    [*] --> Recommended: Save plan
-    Recommended --> InProgress: Portal marks In Progress
-    Recommended --> QuizPending: Portal marks Complete
-    InProgress --> QuizPending: Portal marks Complete
-    QuizPending --> QuizFailed: Submit, score < 4
-    QuizFailed --> QuizPending: Retry
-    QuizPending --> Complete: Submit, score ≥ 4
-    Complete --> [*]
+## 4. Components
 
-    Recommended: 📚 Recommended
-    InProgress: ⏳ In Progress
-    QuizPending: 📝 Awaiting quiz
-    QuizFailed: ❌ Failed (weak topics logged)
-    Complete: 🎉 Complete (skill level bumped)
-```
+| Component | Responsibility |
+|---|---|
+| `index.ts` | Process entry, auth mode, routes, portal webhook, startup jobs |
+| `telemetry.ts`, `observability/` | Agent 365 exporter setup, export-token resolver, span conversation id |
+| `agent.ts` | Routing, card actions, typed shortcuts, email, proactive trigger, failure net (`runDeferred`), telemetry wrappers (`runObserved`) |
+| `client.ts` | LLM agent: system prompt, tools, history, WorkIQ attach, retries |
+| `sharepoint-tools.ts` | The only way the LLM touches SharePoint, plus the write guards |
+| `handlers.ts` | Deterministic flows (skill ratings, save, sync, quiz, milestones, completion) |
+| `career-coach-service.ts` / `career-coach-types.ts` | Pure business rules, typed list access, the goal lifecycle |
+| `llm-tasks.ts` | Narrow LLM calls with JSON output: quiz generation, short-answer grading, completion email text |
+| `cards.ts` | Adaptive Card builders and the card-block parser |
+| `email-conversation.ts`, `email-plan-store.ts` | Email text/prompt/rendering and the pending-plan store |
+| `graph-service.ts`, `subscription-manager.ts` | Graph clients, mail, change subscriptions |
 
-## 6. SharePoint schema
+## 5. Data model (SharePoint)
 
-| List | Access | Purpose |
+| List | Access | Holds |
 |---|---|---|
-| `CompetencyFramework_v2` | read | Role → required-skill mapping (per level) |
-| `LearningCatalog_v2` | read | Courses mapped to skills, with from/to levels |
-| `UserState` | read/write | One row per user — the living plan (JSON columns: Goals, Skills, LearningProgress) |
-| `LearningPortalStatus` | read | Mimicked learning-portal telemetry (the Feature 1 trigger source) |
-| `QuizResponses` | write | Append-only audit log of every quiz attempt |
+| `CompetencyFramework` | read-only | Roles → required skills and levels (seeded from CSV) |
+| `LearningCatalog` | read-only | Courses → skills and level ranges (seeded from CSV) |
+| `UserState` | read/write (guarded) | **One row per goal**: target role, skills, goals, learning progress, manager, milestone flags, lifecycle status |
+| `LearningPortalStatus` | written by the learning portal | Per-user course telemetry (status, percent, time) |
+| `QuizResponses` | append-only | Every quiz attempt with per-question feedback |
 
-Column display-name ↔ internal-name translation is handled by `sharepoint-column-map.ts`. Lists are created idempotently by `npm run setup:sharepoint` and seeded by `npm run seed:reference`.
+`UserState` stores `Goals`, `Skills` and `LearningProgress` as JSON in multi-line text columns. Each learning record carries the latest quiz summary; the full attempt history is in `QuizResponses`.
 
-## 7. Auth model
+**Why one row per goal?** The first design had one row per user, so starting a new goal overwrote the old one and lost its history, and the agent kept showing a finished plan. Rows-per-goal keep history, make "completed" a state instead of a deletion, and let every handler stay simple by reading only the active row.
 
-- **Runtime (agentic auth):** the A365 platform mints a delegated Graph token per turn (`getAgenticGraphClient` in `graph-service.ts`). `/me`, `/me/manager`, and `/me/sendMail` resolve to the user in the current chat. No client secret is used at runtime.
-- **Scripts (MSAL device-code):** `setup:sharepoint` / `seed:reference` / `mark:complete` etc. sign in once interactively as a developer with `Sites.ReadWrite.All`; the token is cached in `.mstoken-cache.json`.
+### Goal lifecycle
 
-## 8. Observability
+```
+                 Save my plan (no active goal)
+   (none) ───────────────────────────────────────► Active
+                                                    │  │
+        all courses quizzed + completion email sent │  │ user saves a different goal
+                                                    ▼  ▼   while this one has progress
+                                              Completed   Replaced
+                                         (read-only history)
+```
 
-`client.ts` configures the A365 `ObservabilityManager` with a token resolver (built-in `AgenticTokenCacheInstance`, or a custom resolver when `Use_Custom_Resolver=true`) and enables the OpenAI Agents auto-instrumentor. The message handler in `agent.ts` builds a baggage scope from the turn context and preloads the observability token before invoking the LLM path, so `invoke_agent` / `chat` spans carry the runtime agent identity. Set `ENABLE_A365_OBSERVABILITY_EXPORTER=true` to export to MAC Activity; the default is console-only.
+- At most **one Active** goal per user.
+- Saving over an Active goal **without** progress edits it in place; **with** progress it becomes Replaced and a new row is created.
+- Completed only after the completion email is sent, so a failed send can be retried.
+- Legacy rows without `PlanStatus` map to Completed (if `Completion100Fired`) or Active.
+- With no Active goal the user gets the welcome card; "previous goals" and "prep my 1:1" can read finished goals (read-only).
 
-## 9. Extension points
+## 6. Key flows
 
-1. **New card flow** — add a renderer in `cards.ts` + an `adaptiveCards.actionExecute(<verb>, …)` route in `agent.ts` + a handler in `handlers.ts`.
-2. **New business rule** — add pure logic to `career-coach-service.ts` (fully unit-testable, no I/O).
-3. **New LLM sub-call** — add a focused function to `llm-tasks.ts`; keep it narrow and structured.
-4. **Different data backend** — swap the SharePoint CRUD in `career-coach-service.ts` / `graph-service.ts`.
-5. **Production mail** — replace delegated `/me/sendMail` with app-only `Mail.Send` + `Sites.Selected`.
+### 6.1 Build and save a plan
+1. Role named in chat → LLM reads the framework and emits the **skillPath** card (dropdowns, 0–4).
+2. *Continue* → the card locks, code matches up to 3 courses per skill gap and sends **planReview**.
+3. *Save my plan* (or email reply "Save it") → the same `savePlan` function applies the lifecycle rules, writes `UserState`, returns a progress card.
+
+### 6.2 Prove a course (quiz)
+Portal row complete, or the user says "I completed X" → server generates 5 questions and keeps the answer key **server-side** → card without answers → submit → deterministic grading (short answers by one narrow LLM call) → pass = 4/5 → course Complete, skill level raised, progress recomputed → milestone / completion cascade → next queued quiz.
+
+### 6.3 Completion
+100% → LLM writes the email text, **code** sends it (To: user, Cc: manager) → on success the goal is marked Completed → the next conversation starts with the welcome card. The chat model is instructed never to send this email itself.
+
+### 6.4 Email
+Inbound email → sender must be an organisation member → thread-scoped history (stable thread id) → same LLM and rules as Teams, with a prompt that excludes interactive steps → reply as HTML (cards become tables). A proposed plan is stored per thread so "Save it" saves exactly that plan.
+
+### 6.5 Learning-portal event
+List change → Graph notification → webhook (validated by a shared secret) → proactive turn → the same sync handler as "check my progress".
+
+## 7. Security and trust boundaries
+
+| Risk | Control |
+|---|---|
+| Prompt injection via user text, email bodies, documents, tool results | System prompt says only system instructions count; Mail/Calendar rules forbid acting on embedded instructions and limit recipients; all writes still go through code guards |
+| LLM claims progress it didn't earn | Progress guard rejects Complete / passed-quiz / skill-level writes; only the quiz grader records them |
+| LLM corrupts lifecycle data | Lifecycle columns stripped from model writes; finished goals read-only; one active goal; role switch with progress rejected |
+| LLM bypasses guards through a second SharePoint path | WorkIQ SharePoint server exposes only read tools |
+| Unknown or external email senders | Ignored; only organisation Members get replies; bounces ignored |
+| Forged webhook | Graph `clientState` / `X-Portal-Secret` must equal `PORTAL_EVENT_SECRET` |
+| Inbound request forgery | JWT auth on `/api/messages` (disabled only with `NODE_ENV=development`) |
+| Secrets | `.env`, `a365.generated.config.json` and runtime state are git-ignored; export tokens are validated and never logged |
+
+## 8. Reliability and error handling
+
+- **Card actions** return immediately and run in the background; on failure `runDeferred` reports to the user and restores the card when resubmitting is safe.
+- **LLM calls** retry transient network errors (3 attempts, backoff) and roll back the unanswered message from history.
+- **Optional dependencies** (MCP servers, telemetry export, the webhook subscription) are best-effort and never block a turn.
+- **Duplicate input** (double-clicks, re-sent Save) is absorbed by in-flight claims, locked cards and the save guard.
+- **Lifecycle events** from the platform are acknowledged by a top-priority route so they can't crash a turn or trigger an error-reply loop.
+- **Process-level** rejections are logged; the server stays up.
+
+Known trade-offs: the quiz answer-key cache and queue are in memory (lost on restart — the user is asked to say "check my progress" to regenerate), and the proactive map, email-plan store and subscription state are local files, which suits a single instance. Running several instances would need shared storage for these.
+
+## 9. Observability design
+
+Goal: every run — LLM turn, button click, email, proactive event — appears in Agent 365 Activity as an agent run with its inputs, outputs, tool steps and errors.
+
+- **Export route**: S2S with an app-only token for the agent identity (delegated tokens are rejected on that route). The token comes from a 3-hop exchange (blueprint credential → FMI assertion → agent identity → Observability API) and is validated before use.
+- **Identity binding**: `gen_ai.agent.id` is the runtime agent identity read from the turn's recipient; the blueprint id travels separately.
+- **Spans**: `invoke_agent` per run, `chat` around the model call, `execute_tool` around code-handled steps; auto-instrumentation adds model usage.
+- **Context**: caller (the employee), channel (Teams / email), session description, and a **conversation id** — the activity id for Teams, the stable thread id for email, so one thread is one conversation.
+- **Verifiability**: `A365_OBSERVABILITY_LOG_LEVEL=info|warn|error` shows exporter and token activity; `a365 query-entra` verifies the blueprint's grants and inheritance.
+
+## 10. Identity and permissions
+
+The agent is registered with `a365 setup all --aiteammate` (blueprint + agent identity + permissions). At runtime it acts as its **own agentic user** (own mailbox and Graph identity), not as the person chatting:
+
+- SharePoint lists: the agent user must be a Member of the site.
+- Completion email and user-requested email come from the agent's mailbox.
+- WorkIQ Mail/Calendar/SharePoint need the MCP grants applied by a Global Administrator (`a365 setup permissions mcp`).
+- Developer scripts use delegated MSAL (device code) instead, as a signed-in admin.
+
+## 11. Configuration
+
+See README §3 for the full table. In short: Azure OpenAI settings, the agent connection written by the CLI, SharePoint site and list names, the portal webhook URL and secret, and the observability switches. List display names are configurable so the lists can be versioned (e.g. `UserState_V3`).
+
+## 12. Deployment topology
+
+Local development exposes port 3978 through a **dev tunnel**; the blueprint's messaging endpoint and the Graph subscription both point at the tunnel URL. The agent is published with `a365 publish`, uploaded in the admin center, configured in Teams Developer Portal (API-based agent, notification URL), then instantiated and approved. For production, host the same Node process anywhere with a public HTTPS endpoint and move the in-memory / file state to shared storage.
+
+## 13. Extension points
+
+| To add… | Where |
+|---|---|
+| A new card or button flow | `cards.ts` builder + `agent.ts` `actionExecute` verb + `handlers.ts` function, wrapped in `runDeferred` / `runObserved` |
+| A new rule or calculation | A pure function in `career-coach-service.ts` |
+| A new typed shortcut | An intent function and a branch before the LLM path in `agent.ts` |
+| A new data field | `setup-sharepoint.ts` schema, `serializeUserState` / `hydrateUserState`, and the prompt's list description |
+| A new LLM tool | `sharepoint-tools.ts` (and a guard if it writes) |
+| A new Microsoft 365 capability | A WorkIQ MCP server in `ToolingManifest.json` (+ admin grant) |
+| Another channel | A notification/route handler that resolves the user, then reuses the same client, handlers and guards |
+
+## 14. Decisions at a glance
+
+| Decision | Alternative rejected | Reason |
+|---|---|---|
+| Deterministic handlers for writes and grading | Let the LLM write SharePoint | Hallucinated progress, double saves, timeouts |
+| Server-side quiz answer key, LLM-authored quizzes discarded | Trust the card the LLM writes | The grader needs the key; the model's cards had none |
+| One row per goal | One row per user, overwrite | Lost history; completed goals kept showing |
+| Email shares the Teams data model and save code | Separate email plan store as the source of truth | Two places for one goal would drift |
+| Per-thread email key from the notification | Activity conversation id | It changes with every message, so history was lost |
+| WorkIQ SharePoint read-only | Allow its write tools | They bypass the progress and lifecycle guards |
+| Completion email sent by code | Let the model send it with the Mail tool | Reliability, a single code path, and no duplicate sends |
+| Run card actions in the background | Do the work inside the invoke | Teams' ~10 s limit |

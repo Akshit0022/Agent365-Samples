@@ -7,13 +7,13 @@
  * Signs the developer in via device-code, then creates all five lists (idempotent):
  *   1. `CompetencyFramework_v2` (reference; seeded from CSV via `npm run seed:reference`)
  *   2. `LearningCatalog_v2`     (reference; seeded from CSV via `npm run seed:reference`)
- *   3. `UserState`             (per-user plan, incl. Phase-B columns)
+ *   3. `UserState`             (one row per goal: the active plan + finished goals as history)
  *   4. `LearningPortalStatus`  (Feature 1: mimic'd portal source)
  *   5. `QuizResponses`         (Feature 2: full audit log of quiz attempts)
  *
  * It also adds the Phase-B columns (`ManagerName`, `ManagerEmail`, `LastSyncDate`,
- * `Milestone80Fired`, `Completion100Fired`) to `UserState` for the legacy case where
- * that list pre-existed without them.
+ * `Milestone80Fired`, `Completion100Fired`) and the goal-lifecycle columns (`PlanStatus`,
+ * `PlanCompletedDate`) to `UserState` for the case where that list pre-existed without them.
  *
  * Idempotent — running it twice is a no-op (skips existing lists / columns).
  *
@@ -108,6 +108,8 @@ const USER_STATE: ListSpec = {
         { name: 'LastSyncDate', spec: dateTime() },
         { name: 'Milestone80Fired', spec: boolean() },
         { name: 'Completion100Fired', spec: boolean() },
+        { name: 'PlanStatus', spec: text() },
+        { name: 'PlanCompletedDate', spec: text() },
     ],
 };
 
@@ -143,6 +145,9 @@ const USER_STATE_NEW_COLUMNS: ColumnSpec[] = [
     { name: 'LastSyncDate', spec: dateTime() },
     { name: 'Milestone80Fired', spec: boolean() },
     { name: 'Completion100Fired', spec: boolean() },
+    // Goal lifecycle: one row per goal — Active / Completed / Replaced.
+    { name: 'PlanStatus', spec: text() },
+    { name: 'PlanCompletedDate', spec: text() },
 ];
 
 // -----------------------------------------------------------------------------
@@ -182,10 +187,12 @@ async function ensureColumn(
 ): Promise<void> {
     // Check if the column already exists on the list.
     const existing = await graph
-        .api(`/sites/${siteId}/lists/${listId}/columns?$select=id,name`)
+        .api(`/sites/${siteId}/lists/${listId}/columns?$select=id,name,displayName`)
         .get()
         .catch(() => ({ value: [] as any[] }));
-    const names: string[] = ((existing?.value ?? []) as Array<{ name: string }>).map((c) => c.name);
+    // Match display names too: CSV-imported lists use internal names like field_14.
+    const names: string[] = ((existing?.value ?? []) as Array<{ name: string; displayName?: string }>)
+        .flatMap((c) => [c.name, c.displayName ?? '']);
     if (names.includes(col.name)) {
         console.log(`[setup]   • Column "${col.name}" already exists — skipping.`);
         return;

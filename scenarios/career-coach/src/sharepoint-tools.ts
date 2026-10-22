@@ -20,6 +20,8 @@ import type { TurnContext, Authorization } from '@microsoft/agents-hosting';
 import { Client as MsGraphClient } from '@microsoft/microsoft-graph-client';
 import { getAgenticGraphClient } from './graph-service';
 import { getColumnMap, toInternalFields, toDisplayFields } from './sharepoint-column-map';
+import { SP_CONFIG, PLAN_LIFECYCLE_FIELDS, planStatusOf } from './career-coach-types';
+import { readUserState, readPreviousPlans, dropMissingLifecycleColumns } from './career-coach-service';
 
 /**
  * The per-run context passed to `run(agent, input, { context })`. Every tool below
@@ -40,7 +42,18 @@ function makeTool(spec: {
     parameters: object;
     execute: (args: any, ctx: any) => Promise<any>;
 }): FunctionTool<any, any, any> {
-    return tool({ ...spec, strict: false } as any) as FunctionTool<any, any, any>;
+    const execute = async (args: any, ctx: any) => {
+        try {
+            return await spec.execute(args, ctx);
+        } catch (err: any) {
+            // The Agents SDK hands tool errors back to the LLM silently; log them so failures are diagnosable.
+            const status = err?.statusCode ?? err?.status ?? '';
+            const code = err?.code ?? '';
+            console.error(`[SharePointTools] ${spec.name} failed${status ? ` (status=${status})` : ''}${code ? ` [${code}]` : ''}: ${err?.message ?? err}`);
+            throw err;
+        }
+    };
+    return tool({ ...spec, execute, strict: false } as any) as FunctionTool<any, any, any>;
 }
 
 function graphFrom(rawCtx: any): MsGraphClient {
@@ -147,6 +160,16 @@ function resolveListId(siteId: string, candidate: unknown): string {
         return byName;
     }
 
+    // Case 2b: LLM dropped a version suffix (e.g. "UserState" for "UserState_V3") — accept a unique match.
+    if (!isLikelyGuid(raw)) {
+        const prefix = `${raw.toLowerCase()}_`;
+        const matches = Array.from(bucket.byName.entries()).filter(([name]) => name.startsWith(prefix));
+        if (matches.length === 1) {
+            console.warn(`[SharePointTools] LLM sent list name "${raw}"; resolving to "${matches[0][0]}" (${matches[0][1]}).`);
+            return matches[0][1];
+        }
+    }
+
     // Case 3: LLM sent a plausible-looking GUID we've never seen — hallucination.
     // We can't recover automatically (no way to know which real list they meant), so
     // let it fall through to Graph which returns "list not found". The LLM will then
@@ -170,6 +193,138 @@ function normalizeFields(fields: unknown): Record<string, unknown> {
         return out;
     }
     return (fields ?? {}) as Record<string, unknown>;
+}
+
+// -----------------------------------------------------------------------------
+// Progress guard — a course only becomes Complete (and a skill only levels up) when the
+// user passes its quiz, and only the deterministic quiz grader (handlers.ts) records that.
+// The LLM may still write other UserState fields; these transitions are rejected.
+// -----------------------------------------------------------------------------
+
+const blockedByTurn = new WeakMap<object, Set<string>>();
+
+/** Course ids the LLM tried to mark complete during this turn (cleared on read). */
+export function takeBlockedCompletions(turnContext: TurnContext): string[] {
+    const blocked = blockedByTurn.get(turnContext);
+    blockedByTurn.delete(turnContext);
+    return blocked ? [...blocked] : [];
+}
+
+function parseJsonArray(value: unknown): any[] {
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+        try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : [];
+        } catch { return []; }
+    }
+    return [];
+}
+
+/** True when listId is the UserState list. Falls back to Graph when the list cache is cold, so a GUID can't bypass the goal-lifecycle rules. */
+async function isUserStateList(graph: MsGraphClient, siteId: string, listId: string): Promise<boolean> {
+    let name = listCacheBySite.get(siteId)?.byId.get(listId);
+    if (!name) {
+        try {
+            const list: any = await graph.api(`/sites/${siteId}/lists/${listId}?$select=id,displayName`).get();
+            if (list?.displayName) { name = String(list.displayName); rememberList(siteId, listId, name); }
+        } catch { /* unknown list: treated as not UserState; Graph reports the real error on the actual call */ }
+    }
+    return (name ?? listId).toLowerCase() === SP_CONFIG.lists.userState.toLowerCase();
+}
+
+/** Strips the app-managed goal-lifecycle columns from an LLM write to UserState. */
+function withoutLifecycleFields(fields: Record<string, unknown>): Record<string, unknown> {
+    const out = { ...fields };
+    for (const name of PLAN_LIFECYCLE_FIELDS) {
+        if (name in out) {
+            console.warn(`[GoalLifecycle] Ignored LLM write to app-managed column "${name}".`);
+            delete out[name];
+        }
+    }
+    return out;
+}
+
+function currentUserId(rawCtx: any): string {
+    const ctx: RunCtx | undefined = rawCtx?.context ?? rawCtx;
+    return String(ctx?.turnContext?.activity?.from?.aadObjectId ?? '');
+}
+
+/** Returns the courses / skills this write would advance without a passed quiz. */
+function findUnearnedProgress(
+    next: Record<string, unknown>,
+    stored: Record<string, unknown> | null,
+): { courses: Array<{ courseId: string; title: string }>; skills: string[] } {
+    const courses: Array<{ courseId: string; title: string }> = [];
+    if ('LearningProgress' in next) {
+        const prev = parseJsonArray(stored?.LearningProgress);
+        for (const lp of parseJsonArray(next.LearningProgress)) {
+            const courseId = String(lp?.courseId ?? '');
+            if (!courseId || courses.some((c) => c.courseId === courseId)) continue;
+            const alreadyValidated = prev.some((p) => p?.courseId === courseId &&
+                String(p?.status ?? '').toLowerCase() === 'complete' && p?.quizResult?.passed === true);
+            if (alreadyValidated) continue;
+            const claimsComplete = String(lp?.status ?? '').toLowerCase() === 'complete';
+            const claimsPassed = lp?.quizResult?.passed === true;
+            if (claimsComplete || claimsPassed) courses.push({ courseId, title: String(lp?.courseTitle ?? courseId) });
+        }
+    }
+    const skills: string[] = [];
+    if ('Skills' in next && stored) {
+        const prev = parseJsonArray(stored.Skills);
+        for (const s of parseJsonArray(next.Skills)) {
+            const before = prev.find((p) => p?.competencyId === s?.competencyId);
+            if (before && Number(s?.currentLevel) > Number(before?.currentLevel)) {
+                skills.push(String(s?.competencyName ?? s?.competencyId));
+            }
+        }
+    }
+    return { courses, skills };
+}
+
+/**
+ * Throws (and records the courses for this turn) when an LLM write to UserState would mark
+ * a course Complete, record a passed quiz, or raise a skill level. The thrown message is
+ * returned to the model as the tool result.
+ */
+async function guardUserStateWrite(
+    rawCtx: any,
+    graph: MsGraphClient,
+    siteId: string,
+    listId: string,
+    itemId: string | undefined,
+    displayFields: Record<string, unknown>,
+    colMap: Awaited<ReturnType<typeof getColumnMap>>,
+): Promise<void> {
+    if (!await isUserStateList(graph, siteId, listId)) return;
+    if (!('LearningProgress' in displayFields) && !('Skills' in displayFields)) return;
+
+    let stored: Record<string, unknown> | null = null;
+    if (itemId) {
+        try {
+            const item = await graph.api(`/sites/${siteId}/lists/${listId}/items/${itemId}?$expand=fields`).get();
+            stored = toDisplayFields(item?.fields ?? {}, colMap);
+        } catch { /* unknown item: compare against an empty plan (strictest) */ }
+    }
+    const { courses, skills } = findUnearnedProgress(displayFields, stored);
+    if (courses.length === 0 && skills.length === 0) return;
+
+    const turnContext: TurnContext | undefined = (rawCtx?.context ?? rawCtx)?.turnContext;
+    if (turnContext && courses.length) {
+        const set = blockedByTurn.get(turnContext) ?? new Set<string>();
+        for (const c of courses) set.add(c.courseId);
+        blockedByTurn.set(turnContext, set);
+    }
+    const parts: string[] = [];
+    if (courses.length) parts.push(`marking ${courses.map((c) => `"${c.title}" (${c.courseId})`).join(', ')} as Complete`);
+    if (skills.length) parts.push(`raising the level of ${skills.join(', ')}`);
+    console.warn(`[ProgressGuard] Blocked UserState write: ${parts.join('; ')}.`);
+    const example = courses[0]?.courseId ?? '<courseId>';
+    throw new Error(
+        `BLOCKED — nothing was written. Progress only changes when the user passes a course quiz, and only the quiz grader records that. ` +
+        `Not allowed: ${parts.join('; ')}. Do NOT retry this update and do NOT tell the user these courses are complete. ` +
+        `To validate a course, emit ONE quiz card (type "quiz") with its courseId (e.g. "${example}"); the system generates and grades it.`,
+    );
 }
 
 const getSiteByPathTool: FunctionTool<any, any, any> = makeTool({
@@ -231,7 +386,7 @@ const listListItemsTool: FunctionTool<any, any, any> = makeTool({
         type: 'object',
         properties: {
             siteId: { type: 'string' },
-            listId: { type: 'string', description: 'The Graph listId GUID (from listLists) OR the list display name (e.g. "UserState", "LearningCatalog_v2"). Display names auto-resolve.' },
+            listId: { type: 'string', description: 'The Graph listId GUID (from listLists) OR the exact list display name from the system prompt (e.g. the configured UserState list). Display names auto-resolve.' },
             filterField: { type: 'string', description: 'Optional. Field name to filter on (e.g. "UserAADId").' },
             filterValue: { type: 'string', description: 'Optional. String value to match. Case-insensitive.' },
         },
@@ -259,6 +414,8 @@ const listListItemsTool: FunctionTool<any, any, any> = makeTool({
             const needle = String(args.filterValue).toLowerCase();
             filtered = rows.filter((r) => String(r.fields?.[key] ?? '').toLowerCase() === needle);
         }
+        // Only the active goal is visible; finished goals are history (see listPreviousGoals).
+        if (await isUserStateList(graph, siteId, listId)) filtered = filtered.filter((r) => planStatusOf(r.fields) === 'Active');
         return JSON.stringify(filtered);
     },
 });
@@ -288,7 +445,20 @@ const createListItemTool: FunctionTool<any, any, any> = makeTool({
         const siteId = resolveSiteId(args.siteId);
         const listId = resolveListId(siteId, args.listId);
         const colMap = await getColumnMap(graph, siteId, listId);
-        const displayFields = normalizeFields(args.fields);
+        let displayFields = normalizeFields(args.fields);
+        if (await isUserStateList(graph, siteId, listId)) {
+            // One active goal per user: a new row is only allowed when there's no active goal.
+            const userId = String(displayFields.UserAADId ?? currentUserId(ctx));
+            const active = userId ? await readUserState(graph, userId, siteId) : null;
+            if (active) {
+                throw new Error(
+                    `BLOCKED — nothing was written. This user already has an active goal (itemId "${active.itemId}", ` +
+                    `TargetRole "${active.state.TargetRole}"). Update that row with updateListItem instead of creating a new one.`,
+                );
+            }
+            displayFields = dropMissingLifecycleColumns({ ...withoutLifecycleFields(displayFields), PlanStatus: 'Active' }, colMap);
+        }
+        await guardUserStateWrite(ctx, graph, siteId, listId, undefined, displayFields, colMap);
         const internalFields = toInternalFields(displayFields, colMap);
         try {
             const created = await graph.api(`/sites/${siteId}/lists/${listId}/items`).post({ fields: internalFields });
@@ -334,7 +504,34 @@ const updateListItemTool: FunctionTool<any, any, any> = makeTool({
         const siteId = resolveSiteId(args.siteId);
         const listId = resolveListId(siteId, args.listId);
         const colMap = await getColumnMap(graph, siteId, listId);
-        const displayFields = normalizeFields(args.fields);
+        let displayFields = normalizeFields(args.fields);
+        if (await isUserStateList(graph, siteId, listId)) {
+            displayFields = withoutLifecycleFields(displayFields);
+            let stored: Record<string, any> | null = null;
+            try {
+                const item = await graph.api(`/sites/${siteId}/lists/${listId}/items/${args.itemId}?$expand=fields`).get();
+                stored = toDisplayFields(item?.fields ?? {}, colMap);
+            } catch { /* unknown item: Graph reports it on the update below */ }
+            const status = stored ? planStatusOf(stored) : 'Active';
+            if (status !== 'Active') {
+                throw new Error(
+                    `BLOCKED — nothing was written. Item "${args.itemId}" is a ${status.toLowerCase()} goal and is read-only history. ` +
+                    `Only the user's active goal (from listListItems) can be updated.`,
+                );
+            }
+            // Switching the active goal to another role must not wipe its progress.
+            const newRole = String(displayFields.TargetRole ?? '').trim().toLowerCase();
+            const oldRole = String(stored?.TargetRole ?? '').trim().toLowerCase();
+            const hasProgress = Number(stored?.OverallProgress ?? 0) > 0 ||
+                parseJsonArray(stored?.LearningProgress).some((lp) => String(lp?.status ?? 'Recommended') !== 'Recommended' || !!lp?.quizResult);
+            if (newRole && oldRole && newRole !== oldRole && hasProgress) {
+                throw new Error(
+                    `BLOCKED — nothing was written. The active "${stored?.TargetRole}" goal has progress and can't be overwritten with a new role. ` +
+                    `Ask the user to click 💾 Save my plan on the plan card — the app keeps the unfinished goal as history and starts the new one.`,
+                );
+            }
+        }
+        await guardUserStateWrite(ctx, graph, siteId, listId, String(args.itemId ?? ''), displayFields, colMap);
         const internalFields = toInternalFields(displayFields, colMap);
         try {
             const updated = await graph.api(`/sites/${siteId}/lists/${listId}/items/${args.itemId}/fields`).update(internalFields);
@@ -352,8 +549,40 @@ const updateListItemTool: FunctionTool<any, any, any> = makeTool({
     },
 });
 
+const listPreviousGoalsTool: FunctionTool<any, any, any> = makeTool({
+    name: 'listPreviousGoals',
+    description:
+        "List the current user's previous (finished) career goals, most recent first: Completed goals and goals Replaced by a newer one. " +
+        'Each entry has the full detail (skills with levels, courses with completion + quiz results, goal progress, manager asks), enough to build a progress summary or a 1:1 prep brief. ' +
+        'Read-only. Use when the user asks about previous / past / completed goals or history, or when they ask for a 1:1 prep and have no active goal.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    execute: async (_args: any, ctx: any) => {
+        const userId = currentUserId(ctx);
+        if (!userId) return JSON.stringify([]);
+        const plans = await readPreviousPlans(graphFrom(ctx), userId);
+        return JSON.stringify(plans.map(({ state: s }, i) => ({
+            goalNumber: i + 1,
+            targetRole: s.TargetRole,
+            status: s.PlanStatus,
+            planCreatedDate: s.PlanCreatedDate,
+            finishedDate: s.PlanCompletedDate ?? null,
+            overallProgress: s.OverallProgress,
+            managerAsks: s.ManagerAsks || null,
+            goals: (s.Goals ?? []).map((g) => ({ name: g.competencyName, progressPct: g.progressPct, status: g.status })),
+            skills: (s.Skills ?? []).map((k) => ({ name: k.competencyName, currentLevel: k.currentLevel, targetLevel: k.targetLevel, gap: k.gap })),
+            courses: (s.LearningProgress ?? []).map((lp) => ({
+                title: lp.courseTitle,
+                status: lp.status,
+                completedDate: lp.completedDate ?? null,
+                timeSpentMinutes: lp.timeSpentMinutes ?? null,
+                quizScore: lp.quizResult ? `${lp.quizResult.score}/5` : null,
+            })),
+        })));
+    },
+});
+
 export function makeSharePointTools(): FunctionTool<any, any, any>[] {
-    return [getSiteByPathTool, listListsTool, listListItemsTool, createListItemTool, updateListItemTool];
+    return [getSiteByPathTool, listListsTool, listListItemsTool, createListItemTool, updateListItemTool, listPreviousGoalsTool];
 }
 
 /**

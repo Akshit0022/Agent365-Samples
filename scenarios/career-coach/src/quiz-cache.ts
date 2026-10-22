@@ -52,3 +52,44 @@ export function bumpAttempts(userAADId: string, courseId: string): number {
 export function clearQuiz(userAADId: string, courseId: string): void {
     cache.delete(keyOf(userAADId, courseId));
 }
+
+// ----------------------------------------------------------------------------
+// Graded markers — lets the submit handler recognise a resubmit of an already-graded card.
+// ----------------------------------------------------------------------------
+
+const graded = new Set<string>();
+
+export function markGraded(userAADId: string, courseId: string): void {
+    graded.add(keyOf(userAADId, courseId));
+}
+
+export function unmarkGraded(userAADId: string, courseId: string): void {
+    graded.delete(keyOf(userAADId, courseId));
+}
+
+export function wasGraded(userAADId: string, courseId: string): boolean {
+    return graded.has(keyOf(userAADId, courseId));
+}
+
+// ----------------------------------------------------------------------------
+// Pending-quiz queue — courses the user reported as completed in chat that still need a
+// quiz. Learning-portal completions are tracked in SharePoint; chat reports only live here.
+// ----------------------------------------------------------------------------
+
+const pending = new Map<string, string[]>();
+
+export function queueQuizzes(userAADId: string, courseIds: string[]): void {
+    const key = userAADId.toLowerCase();
+    const list = pending.get(key) ?? [];
+    for (const id of courseIds) if (id && !list.includes(id)) list.push(id);
+    pending.set(key, list);
+}
+
+export function dequeueQuiz(userAADId: string, courseId: string): void {
+    const key = userAADId.toLowerCase();
+    pending.set(key, (pending.get(key) ?? []).filter((id) => id !== courseId));
+}
+
+export function peekQueuedQuizzes(userAADId: string): string[] {
+    return [...(pending.get(userAADId.toLowerCase()) ?? [])];
+}

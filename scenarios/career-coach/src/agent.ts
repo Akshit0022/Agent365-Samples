@@ -7,23 +7,26 @@ import { configDotenv } from 'dotenv';
 configDotenv();
 
 import { TurnState, AgentApplication, TurnContext, MemoryStorage, MessageFactory } from '@microsoft/agents-hosting';
-import { Activity, ActivityTypes } from '@microsoft/agents-activity';
-import { BaggageBuilder } from '@microsoft/agents-a365-observability';
-import { AgenticTokenCacheInstance, BaggageBuilderUtils } from '@microsoft/agents-a365-observability-hosting'
-import { getObservabilityAuthenticationScope } from '@microsoft/agents-a365-runtime';
+import { Activity, ActivityTypes, Attachment } from '@microsoft/agents-activity';
+// A365 Observability — best-effort instrumentation (verify against official sample)
+import { BaggageBuilder, BaggageBuilderUtils, ExecuteToolScope, InvokeAgentScope } from '@microsoft/opentelemetry';
+import type { AgentDetails, CallerDetails, InvokeAgentScopeDetails, A365Request, Channel } from '@microsoft/opentelemetry';
 
 // Notification Imports
 import '@microsoft/agents-a365-notifications';
 import { AgentNotificationActivity, NotificationType, createEmailResponseActivity } from '@microsoft/agents-a365-notifications';
 
-import { Client, getClient } from './client';
+import { Client, getClient, hasClient } from './client';
 import { extractCards, buildMessageCard, defaultWelcomeAttachment, CardPayload, renderCard } from './cards';
-import { getMyProfile, getMyManager, sendMail, getAgenticGraphClient } from './graph-service';
+import { getAgenticGraphClient } from './graph-service';
 import * as proactiveRefs from './proactive-refs';
-import tokenCache, { createAgenticTokenCacheKey } from './token-cache';
 import { FileStorage } from './file-storage';
-import { handleSkillRatingsSubmit, handleSavePlanSubmit, handleQuizSubmit, handleSyncProgress, SkillRatingInput } from './handlers';
-import { summarizeEmailSafely } from './llm-tasks';
+import { handleSkillRatingsSubmit, handleSavePlanSubmit, savePlan, savePlanInputFromReview, handleQuizSubmit, handleSyncProgress, emitQuizFor, queueReportedCourses, savedPlanReviewCard, handleCompletedAllCourses, findReportedCourses, handleReportedCompletions, validateBlockedCourses, SkillRatingInput } from './handlers';
+import { getQuiz, queueQuizzes, wasGraded } from './quiz-cache';
+import { takeBlockedCompletions } from './sharepoint-tools';
+import { extractEmailText, extractQuotedHistory, emailTurnPrompt, llmResponseToEmailHtml, isSavePlanIntent, findPlanReview, cardPayloadToHtml, markdownToHtml } from './email-conversation';
+import { getPendingPlan, putPendingPlan, clearPendingPlan } from './email-plan-store';
+import { observabilityConversationId, observabilitySessionDescription, setObservabilityConversationId } from './observability/conversation-id';
 
 /**
  * Adaptive Card Action.Execute delivers the full action envelope
@@ -44,6 +47,62 @@ async function sendPreface(ctx: TurnContext, text: string): Promise<void> {
   try { await ctx.sendActivity(MessageFactory.text(text)); } catch { /* non-fatal */ }
 }
 
+/**
+ * Summarizes an outgoing activity for observability output messages: message text as-is,
+ * Adaptive Cards as "[card] <first TextBlock>". Typing indicators etc. are ignored.
+ */
+function describeOutgoing(activity: Partial<Activity>): string | undefined {
+  if (activity?.type && activity.type !== 'message') return undefined;
+  const parts: string[] = [];
+  if (activity?.text) parts.push(String(activity.text));
+  for (const att of activity?.attachments ?? []) {
+    const body: any[] = (att as any)?.content?.body ?? [];
+    const firstText = (function find(items: any[]): string | undefined {
+      for (const item of items ?? []) {
+        if (item?.type === 'TextBlock' && item.text) return String(item.text);
+        const nested = find(item?.items ?? item?.columns ?? []);
+        if (nested) return nested;
+      }
+      return undefined;
+    })(body);
+    parts.push(`[card] ${firstText ?? (att as any)?.contentType ?? 'attachment'}`);
+  }
+  for (const entity of (activity?.entities ?? []) as any[]) {
+    if (entity?.type === 'emailResponse' && entity.htmlBody) {
+      const plain = String(entity.htmlBody).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      parts.push(`[email reply] ${plain}`);
+    }
+  }
+  const out = parts.join('\n').trim();
+  return out ? out.slice(0, 1000) : undefined;
+}
+
+/**
+ * Detects bounce / non-delivery-report (NDR) emails. Replying to them fails (502) and only
+ * loops the error, so they're ignored. Matches on the system sender or on the standard NDR text.
+ */
+function isBounceEmail(activity: Partial<Activity>, htmlBody?: string): boolean {
+  const from = activity?.from as any;
+  const sender = `${from?.name ?? ''} ${from?.id ?? ''}`.toLowerCase();
+  if (/postmaster|mailer-daemon|microsoftexchange[0-9a-f]{6,}/.test(sender) || sender.trim().startsWith('microsoft outlook')) return true;
+  const text = `${activity?.text ?? ''} ${htmlBody ?? ''}`.toLowerCase().replace(/<[^>]+>/g, ' ');
+  return [
+    'delivery has failed to these recipients',
+    'undeliverable:',
+    'delivery status notification (failure)',
+    "your message couldn't be delivered",
+    'your message could not be delivered',
+    'mail delivery failed',
+  ].some((p) => text.includes(p));
+}
+
+/** True for transient network failures (DNS, connection resets, timeouts) — worth a simple retry. */
+function isNetworkError(err: unknown): boolean {
+  const e = err as any;
+  const text = `${e?.message ?? ''} ${e?.code ?? ''} ${e?.cause?.code ?? ''} ${e?.cause?.message ?? ''}`.toLowerCase();
+  return /fetch failed|enotfound|eai_again|econnreset|econnrefused|etimedout|socket hang up|network|timed out|timeout|und_err/.test(text);
+}
+
 /** Detect free-text phrases that mean "check my progress" / "run a sync". */
 function isSyncIntent(text: string): boolean {
   const t = text.toLowerCase().trim();
@@ -54,6 +113,25 @@ function isSyncIntent(text: string): boolean {
     'refire milestones', 'recheck progress', 'progress check',
   ];
   return patterns.some((p) => t === p || t.includes(p));
+}
+
+/** Detect "I completed all (the/my) courses" style messages (not negated ones). */
+export function isCompletedAllIntent(text: string): boolean {
+  const t = text.toLowerCase().replace(/[’']/g, "'").trim();
+  if (t.endsWith('?')) return false;
+  if (/\b(not|haven't|havent|didn't|didnt|yet to|still need|how do i|can i)\b/.test(t)) return false;
+  const verb = /\b(completed|complete|finished|finish|done)\b/.test(t);
+  const all = /\b(all|every|each)\b/.test(t);
+  const what = /\b(courses?|trainings?|modules?|of them|everything|my plan|the plan|learning)\b/.test(t) || /\b(all|everything)\s*[.!🎉]*$/.test(t);
+  return verb && all && what;
+}
+
+/** Detect "I completed / finished …" course reports (not questions or negations). */
+export function isCompletionReport(text: string): boolean {
+  const t = text.toLowerCase().replace(/[’']/g, "'").trim();
+  if (t.endsWith('?')) return false;
+  if (/\b(not|haven't|havent|didn't|didnt|yet to|still need|how do i|can i)\b/.test(t)) return false;
+  return /\b(completed|complete|finished|finish|done|passed)\b/.test(t);
 }
 
 export class MyAgent extends AgentApplication<TurnState> {
@@ -136,16 +214,63 @@ export class MyAgent extends AgentApplication<TurnState> {
           return 'Sorry — could not identify the quiz. Please try again.';
         }
         console.log(`[Quiz] Deterministic grading for course ${courseId} (${Object.keys(answersByQuestionId).length} answers).`);
+        // Lock the card: replace it with a read-only copy showing the submitted answers so it
+        // can't be edited or resubmitted. Best-effort, same pattern as the skill-ratings card.
+        try {
+          const cardMessageId = (context.activity as any).replyToId;
+          const questions = getQuiz(userAADId, courseId);
+          if (cardMessageId && questions && questions.length > 0) {
+            const readOnlyAttachment = renderCard({
+              type: 'quiz',
+              courseId,
+              courseTitle: String(data?.courseTitle ?? '') || courseId,
+              skillId,
+              intro: '5 quick questions to lock in what you learned. Pass = 4 of 5.',
+              questions: questions.map((q) => ({ id: q.id, type: q.type, text: q.text, choices: q.choices, topicTag: q.topicTag })),
+              readOnly: true,
+              answers: answersByQuestionId,
+            });
+            if (readOnlyAttachment) {
+              await context.updateActivity({ type: 'message', id: cardMessageId, attachments: [readOnlyAttachment] } as any);
+              console.log(`[Quiz] Card updated to read-only (id=${cardMessageId}).`);
+            }
+          }
+        } catch (err) {
+          console.warn('[Quiz] updateActivity to read-only failed (non-fatal):', (err as any)?.message ?? err);
+        }
         // Fire-and-forget so the invoke returns fast (LLM short-answer grading + writes
         // can take ~5-10s; Teams' invoke timeout is ~10s and shows a red banner if we exceed it).
-        handleQuizSubmit(context, this.authorization, {
-          userAADId,
-          courseId,
-          skillId,
-          answersByQuestionId,
-        }).catch((err) => {
-          console.error('[Quiz] Deferred handleQuizSubmit failed:', (err as any)?.message ?? err);
-        });
+        const quizTitle = String(data?.courseTitle ?? '') || courseId;
+        const answerSummary = Object.entries(answersByQuestionId).map(([id, a]) => `${id}: ${a || '(no answer)'}`).join('\n');
+        this.runDeferred(context, {
+          label: 'Quiz',
+          action: `grade your **${quizTitle}** quiz`,
+          // Safe to resubmit only while the attempt wasn't recorded; keeps the user's answers.
+          restore: () => {
+            const questions = getQuiz(userAADId, courseId);
+            if (wasGraded(userAADId, courseId) || !questions?.length) return undefined;
+            return renderCard({
+              type: 'quiz',
+              courseId,
+              courseTitle: quizTitle,
+              skillId,
+              intro: '5 quick questions to lock in what you learned. Pass = 4 of 5.',
+              questions: questions.map((q) => ({ id: q.id, type: q.type, text: q.text, choices: q.choices, topicTag: q.topicTag })),
+              answers: answersByQuestionId,
+            });
+          },
+          retryHint: (restored) => restored
+            ? 'Your answers are still filled in — click **Submit answers** to try again.'
+            : 'Say **check my progress** and I\'ll pick up where we left off.',
+        }, () => this.runObserved(context, `Submitted quiz answers for ${quizTitle} (${courseId}):\n${answerSummary}`,
+          { name: 'grade_quiz', description: 'Grade the course quiz and record the result', args: { courseId, skillId } },
+          () => handleQuizSubmit(context, this.authorization, {
+            userAADId,
+            courseId,
+            skillId,
+            answersByQuestionId,
+          }),
+        ));
         return 'Grading your answers…';
       } catch (err) {
         console.error('[Quiz] Failed to route quiz submission:', (err as any)?.message ?? err);
@@ -231,9 +356,31 @@ export class MyAgent extends AgentApplication<TurnState> {
         }
 
         // Fire-and-forget deterministic handler (SharePoint reads take ~1-2s; still returns fast).
-        handleSkillRatingsSubmit(context, this.authorization, { roleTitle, skills }).catch((err) => {
-          console.error('[SkillRatings] Deferred plan-review build failed:', (err as any)?.message ?? err);
-        });
+        const ratingSummary = skills.map((s) => `${s.name}: ${s.level ?? 'not rated'} (target ${s.target})`).join('\n');
+        this.runDeferred(context, {
+          label: 'SkillRatings',
+          action: `build your **${roleTitle}** gap analysis`,
+          // Unlock the rating card with the user's picks kept, unless the plan was already shown.
+          restore: (delivered) => delivered > 0 ? undefined : renderCard({
+            type: 'skillPath',
+            roleTitle,
+            interactive: true,
+            intro: `Rate your current level for each skill (0 = never touched, 4 = advanced).`,
+            skills: skills.map((s) => ({
+              id: s.id,
+              competencyId: s.competencyId,
+              name: s.name,
+              target: s.target,
+              currentLevel: s.level ?? 0,
+            })),
+          }),
+          retryHint: (restored) => restored
+            ? 'Your ratings are still selected — click **Continue — see my gaps** to try again.'
+            : `Reply with **${roleTitle}** to start the ratings again.`,
+        }, () => this.runObserved(context, `Rated my skills for ${roleTitle}:\n${ratingSummary}`,
+          { name: 'build_plan_review', description: 'Compute skill gaps and recommend courses', args: { roleTitle } },
+          () => handleSkillRatingsSubmit(context, this.authorization, { roleTitle, skills }),
+        ));
         return 'Got it — building your gap analysis and course picks…';
       } catch (err) {
         console.error('[SkillRatings] routing failed:', (err as any)?.message ?? err);
@@ -265,11 +412,33 @@ export class MyAgent extends AgentApplication<TurnState> {
           console.warn('[SavePlan] Missing ratings in payload; the plan may be saved with empty Skills/Goals.');
         }
         console.log(`[SavePlan] Deterministic save: role="${roleTitle}" groups=${groups.length} ratings=${ratings.length}`);
-        handleSavePlanSubmit(context, this.authorization, {
-          userAADId, displayName, roleTitle, targetRoleId, groups, ratings,
-        }).catch((err) => {
-          console.error('[SavePlan] Deferred save failed:', (err as any)?.message ?? err);
-        });
+        // Lock the card: swap it for a read-only "Plan saved" copy so Save can't be clicked again.
+        try {
+          const cardMessageId = (context.activity as any).replyToId;
+          const savedAttachment = cardMessageId ? renderCard(savedPlanReviewCard({ roleTitle, groups, ratings })) : undefined;
+          if (cardMessageId && savedAttachment) {
+            await context.updateActivity({ type: 'message', id: cardMessageId, attachments: [savedAttachment] } as any);
+            console.log(`[SavePlan] Card updated to saved/read-only (id=${cardMessageId}).`);
+          }
+        } catch (err) {
+          console.warn('[SavePlan] updateActivity to read-only failed (non-fatal):', (err as any)?.message ?? err);
+        }
+        const courseCount = groups.reduce((n: number, g: any) => n + (Array.isArray(g?.courses) ? g.courses.length : 0), 0);
+        this.runDeferred(context, {
+          label: 'SavePlan',
+          action: `save your **${roleTitle}** plan`,
+          // Bring the Save button back, unless the saved plan was already shown.
+          restore: (delivered) => delivered > 0 ? undefined
+            : renderCard({ ...savedPlanReviewCard({ roleTitle, groups, ratings }), saved: false, footer: "Click 💾 Save my plan when you're ready." }),
+          retryHint: (restored) => restored
+            ? 'Click **💾 Save my plan** again to retry.'
+            : 'Say **check my progress** to see what was saved.',
+        }, () => this.runObserved(context, `Save my plan: ${roleTitle} (${courseCount} courses across ${groups.length} skills)`,
+          { name: 'save_plan', description: 'Save the career plan to SharePoint and show the progress card', args: { roleTitle, courseCount } },
+          () => handleSavePlanSubmit(context, this.authorization, {
+            userAADId, displayName, roleTitle, targetRoleId, groups, ratings,
+          }),
+        ));
         return 'Saving your plan…';
       } catch (err) {
         console.error('[SavePlan] routing failed:', (err as any)?.message ?? err);
@@ -291,9 +460,14 @@ export class MyAgent extends AgentApplication<TurnState> {
           if (!aadObjectId) return 'I could not identify you. Please try again.';
           // Fire-and-forget — sync + card render + potential milestone cascade can take a few
           // seconds; returning fast prevents Teams' invoke timeout ("Something went wrong").
-          handleSyncProgress(context, this.authorization, aadObjectId).catch((err) => {
-            console.error('[Welcome] handleSyncProgress failed:', (err as any)?.message ?? err);
-          });
+          this.runDeferred(context, {
+            label: 'Welcome',
+            action: 'check your progress',
+            retryHint: () => 'Say **check my progress** to try again.',
+          }, () => this.runObserved(context, 'Show my progress (welcome card tile)',
+            { name: 'sync_progress', description: 'Sync learning progress from the learning portal and show the progress card' },
+            () => handleSyncProgress(context, this.authorization, aadObjectId),
+          ));
           return 'Checking your progress…';
         }
         const synthByIntent: Record<string, string> = {
@@ -310,9 +484,11 @@ export class MyAgent extends AgentApplication<TurnState> {
         (context.activity as any).value = undefined;
         // Fire-and-forget so the invoke returns fast — the full LLM turn (with SharePoint reads)
         // can easily exceed Teams' 10s Action.Execute timeout otherwise.
-        this.handleAgentMessageActivity(context, state).catch((err) => {
-          console.error('[Welcome] Deferred LLM turn failed:', (err as any)?.message ?? err);
-        });
+        this.runDeferred(context, {
+          label: 'Welcome',
+          action: 'start that',
+          retryHint: () => 'Please type what you\'d like to do (for example, "I want to set a new goal").',
+        }, () => this.handleAgentMessageActivity(context, state));
         return 'On it — one moment…';
       } catch (err) {
         console.error('[Welcome] routing failed:', (err as any)?.message ?? err);
@@ -364,12 +540,48 @@ export class MyAgent extends AgentApplication<TurnState> {
     if (aadObjectId && isSyncIntent(effectiveUserMessage)) {
       console.log(`[Sync] Deterministic sync triggered by user text: "${effectiveUserMessage}"`);
       try {
-        await handleSyncProgress(turnContext, this.authorization, aadObjectId);
+        await this.runObserved(turnContext, effectiveUserMessage,
+          { name: 'sync_progress', description: 'Sync learning progress from the learning portal and show the progress card' },
+          () => handleSyncProgress(turnContext, this.authorization, aadObjectId));
       } catch (err) {
         console.error('[Sync] handleSyncProgress failed:', (err as any)?.message ?? err);
         await turnContext.sendActivity(MessageFactory.text(`Sorry — I hit an error syncing your progress: ${(err as any)?.message ?? err}`));
       }
       return;
+    }
+
+    // "I completed all the courses" → deterministic: list every not-yet-validated course in the
+    // plan and quiz them one by one (the LLM path can't match "all" to specific courses).
+    if (aadObjectId && isCompletedAllIntent(effectiveUserMessage)) {
+      console.log(`[CompletedAll] Triggered by user text: "${effectiveUserMessage}"`);
+      try {
+        await this.runObserved(turnContext, effectiveUserMessage,
+          { name: 'validate_all_courses', description: 'List every course in the plan still to validate and start the first quiz' },
+          () => handleCompletedAllCourses(turnContext, this.authorization, aadObjectId));
+      } catch (err) {
+        console.error('[CompletedAll] handleCompletedAllCourses failed:', (err as any)?.message ?? err);
+        await turnContext.sendActivity(MessageFactory.text(`Sorry — I hit an error checking your courses: ${(err as any)?.message ?? err}`));
+      }
+      return;
+    }
+
+    // "I completed <course> …" naming courses from the plan → deterministic quiz queue.
+    // Falls through to the LLM when no plan course is named (e.g. a course outside the plan).
+    if (aadObjectId && isCompletionReport(effectiveUserMessage)) {
+      try {
+        const reported = await findReportedCourses(turnContext, this.authorization, aadObjectId, effectiveUserMessage);
+        if (reported) {
+          console.log(`[CompletedCourses] Deterministic quiz queue for: "${effectiveUserMessage.replace(/\s+/g, ' ').slice(0, 120)}"`);
+          await this.runObserved(turnContext, effectiveUserMessage,
+            { name: 'validate_reported_courses', description: 'Quiz the courses the user reported as completed', args: { courseIds: reported.named.map((lp) => lp.courseId) } },
+            () => handleReportedCompletions(turnContext, this.authorization, aadObjectId, reported));
+          return;
+        }
+      } catch (err) {
+        console.error('[CompletedCourses] handleReportedCompletions failed:', (err as any)?.message ?? err);
+        await turnContext.sendActivity(MessageFactory.text(`Sorry — I hit an error checking your courses: ${(err as any)?.message ?? err}`));
+        return;
+      }
     }
 
     // Send a typing indicator immediately (awaited so it arrives before the LLM call starts).
@@ -396,44 +608,70 @@ export class MyAgent extends AgentApplication<TurnState> {
 
     startTypingLoop();
 
-    // Populate baggage consistently from TurnContext using hosting utilities
+    // A365 Observability — best-effort instrumentation (verify against official sample)
+    // Outer baggage scope populated from TurnContext (tenant / agent identity). The exporter's
+    // app-only token is resolved on demand by the token resolver (see telemetry.ts).
     const baggageScope = BaggageBuilderUtils.fromTurnContext(
       new BaggageBuilder(),
-      turnContext
-    ).sessionDescription('Initial onboarding session')
+      turnContext as any
+    ).sessionDescription(observabilitySessionDescription(turnContext))
       .build();
-
-    // Preloads or refreshes the Observability token used by the Agent 365 Observability exporter.
-    await this.preloadObservabilityToken(turnContext);
 
     try {
       await baggageScope.run(async () => {
-        const client: Client = await getClient(this.authorization, MyAgent.authHandlerName, turnContext, displayName);
-        const response = await client.invokeAgentWithScope(effectiveUserMessage, { turnContext, authorization: this.authorization });
-        // New-user welcome: the model emits a ::welcome:: control token; we render the
-        // designed welcome card here (with the real display name) instead of prose.
-        if (response.includes('::welcome::')) {
-          await turnContext.sendActivity(MessageFactory.attachment(defaultWelcomeAttachment(displayName)));
-          return;
-        }
-        // Feature 4 — 100% completion email. The LLM emits `::send-completion-email:: {JSON}`
-        // after it has already written Completion100Fired=true to UserState in the same turn.
-        // The payload contains the LLM-composed subject + htmlBody + a summary block (roleTitle,
-        // coursesCompleted, totalTimeMinutes). We add the recipients from Graph and dispatch.
-        if (response.includes('::send-completion-email::')) {
-          await this.handleCompletionEmail(turnContext, response);
-          return;
-        }
-        // Render EVERY response as an Adaptive Card: any leading prose becomes a message
-        // card, followed by any structured ```card views the model emitted.
-        const { text, attachments } = extractCards(response);
-        const cards = [] as ReturnType<typeof buildMessageCard>[];
-        if (text) cards.push(buildMessageCard(text));
-        cards.push(...attachments);
-        if (cards.length > 0) {
-          await turnContext.sendActivity(MessageFactory.list(cards));
-        } else {
-          await turnContext.sendActivity(response);
+        // InvokeAgentScope wraps the whole agent turn; the InferenceScope in
+        // client.invokeAgentWithScope nests under it.
+        const invokeScope = this.startInvokeAgentScope(turnContext, effectiveUserMessage);
+        try {
+          await invokeScope.withActiveSpanAsync(async () => {
+            const client: Client = await getClient(this.authorization, MyAgent.authHandlerName, turnContext, displayName);
+            const response = await client.invokeAgentWithScope(effectiveUserMessage, { turnContext, authorization: this.authorization });
+            invokeScope.recordOutputMessages([response]);
+            // New-user welcome: the model emits a ::welcome:: control token; we render the
+            // designed welcome card here (with the real display name) instead of prose.
+            if (response.includes('::welcome::')) {
+              await turnContext.sendActivity(MessageFactory.attachment(defaultWelcomeAttachment(displayName)));
+              return;
+            }
+            // Render EVERY response as an Adaptive Card: any leading prose becomes a message
+            // card, followed by any structured ```card views the model emitted.
+            // Quiz cards are deferred: an LLM-authored quiz has no server-side answer key, so
+            // the deterministic grader can't score it. We regenerate it via emitQuizFor instead.
+            const { text, attachments, deferred } = extractCards(response, { deferTypes: ['quiz'] });
+            const cards = [] as ReturnType<typeof buildMessageCard>[];
+            if (text) cards.push(buildMessageCard(text));
+            cards.push(...attachments);
+            if (cards.length > 0) {
+              await turnContext.sendActivity(MessageFactory.list(cards));
+            } else if (deferred.length === 0) {
+              await turnContext.sendActivity(response);
+            }
+            const quizUser = turnContext.activity?.from?.aadObjectId;
+            const quiz = deferred.find((p) => p.type === 'quiz') as Extract<CardPayload, { type: 'quiz' }> | undefined;
+            // Courses the progress guard stopped the LLM from marking Complete this turn.
+            const blocked = takeBlockedCompletions(turnContext);
+            if (quiz && quizUser && quiz.courseId) {
+              console.log(`[Quiz] Replacing LLM-authored quiz with deterministic quiz for course ${quiz.courseId}.`);
+              try {
+                const queued = await queueReportedCourses(turnContext, this.authorization, quizUser, effectiveUserMessage, String(quiz.courseId));
+                if (queued.length) console.log(`[Quiz] Queued ${queued.length} more reported course(s): ${queued.join(' | ')}`);
+              } catch (err) {
+                console.warn('[Quiz] Could not queue reported courses (non-fatal):', (err as any)?.message ?? err);
+              }
+              queueQuizzes(quizUser, blocked.filter((id) => id !== String(quiz.courseId)));
+              await emitQuizFor(turnContext, this.authorization, quizUser, String(quiz.courseId));
+            } else if (blocked.length && quizUser) {
+              // The LLM tried to mark courses Complete without a quiz and didn't offer one —
+              // start the quizzes ourselves so the user isn't left waiting.
+              console.log(`[ProgressGuard] Starting quizzes for blocked course(s): ${blocked.join(', ')}`);
+              await validateBlockedCourses(turnContext, this.authorization, quizUser, blocked);
+            }
+          });
+        } catch (scopeError) {
+          invokeScope.recordError(scopeError as Error);
+          throw scopeError;
+        } finally {
+          invokeScope.dispose();
         }
       });
     } catch (error) {
@@ -451,117 +689,62 @@ export class MyAgent extends AgentApplication<TurnState> {
   }
 
   /**
-   * Feature 4 — dispatches the "career plan complete" email to the user + their manager
-   * via Microsoft Graph. Uses the AGENTIC-auth Graph client (a fresh token exchanged from
-   * the agentic identity every turn), so this runs as the agent — not as any developer.
-   * Expects the LLM response to contain a control token of the form:
-   *
-   *   ::send-completion-email:: {"subject":"…","htmlBody":"…","roleTitle":"…","coursesCompleted":N,"totalTimeMinutes":N}
-   *
-   * On success renders a `completionSummary` Adaptive Card in-chat.
-   * On failure (missing manager, Graph 5xx) the card explains what happened; we NEVER crash
-   * the turn.
-   *
-   * If the agentic identity doesn't have `User.Read.All` / `Mail.Send` consented, the Graph
-   * calls throw with a clear "Insufficient privileges…" message that surfaces on the card.
+   * Runs a card action's work after the invoke has already returned ("Got it…", "Saving…").
+   * On failure the user is told, instead of the chat going silent: the clicked card is unlocked
+   * (via `restore`, e.g. with the user's picks kept) when it's safe to resubmit, and a short
+   * message explains what failed and how to retry. `restore` receives how many messages the
+   * work already delivered, so it can skip unlocking when results were already shown.
    */
-  private async handleCompletionEmail(turnContext: TurnContext, response: string): Promise<void> {
-    const marker = '::send-completion-email::';
-    const idx = response.indexOf(marker);
-    let payload: {
-      subject?: string;
-      htmlBody?: string;
-      roleTitle?: string;
-      coursesCompleted?: number;
-      totalTimeMinutes?: number;
-    } = {};
-    if (idx >= 0) {
-      const tail = response.slice(idx + marker.length).trim();
-      // Extract the first balanced JSON object after the token.
-      const match = tail.match(/\{[\s\S]*?\}/);
-      if (match) {
-        try { payload = JSON.parse(match[0]); }
-        catch (e) { console.warn('[Completion] Could not parse ::send-completion-email:: JSON:', (e as any)?.message ?? e); }
-      }
-    }
-
-    const subject = payload.subject
-      || `🎓 Career plan complete${payload.roleTitle ? `: ${payload.roleTitle}` : ''}`;
-    const htmlBody = payload.htmlBody
-      || `<p>Great news — a career plan has just been completed.</p>`;
-
-    // Resolve the affected user (the chatter, from the turn) — agentic auth needs their
-    // AAD Object ID because `/me` doesn't exist for app-only tokens.
-    const userAadId = turnContext.activity?.from?.aadObjectId;
-    if (!userAadId) {
-      console.warn('[Completion] Missing turnContext.activity.from.aadObjectId — cannot resolve user for email.');
-    }
-
-    let managerName: string | undefined;
-    let managerEmail: string | undefined;
-    let userEmail: string | undefined;
-    let note: string | undefined;
-    let sent = false;
+  private async runDeferred(
+    context: TurnContext,
+    opts: {
+      label: string;
+      action: string;
+      restore?: (delivered: number) => Attachment | undefined;
+      retryHint: (restored: boolean) => string;
+    },
+    work: () => Promise<unknown>,
+  ): Promise<void> {
+    let delivered = 0;
+    context.onSendActivities(async (_ctx, activities, next) => {
+      const result = await next();
+      delivered += activities.filter((a) => a.type === 'message').length;
+      return result;
+    });
     try {
-      const graph = getAgenticGraphClient(turnContext, this.authorization);
-      const [me, mgr] = await Promise.all([
-        getMyProfile(graph, userAadId),
-        getMyManager(graph, userAadId),
-      ]);
-      userEmail = me?.mail || me?.userPrincipalName;
-      if (mgr?.mail) {
-        managerName = mgr.displayName;
-        managerEmail = mgr.mail;
-        await sendMail({
-          graph,
-          fromUserId: userAadId,
-          to: [managerEmail],
-          cc: userEmail ? [userEmail] : undefined,
-          subject,
-          htmlBody,
-        });
-        sent = true;
-      } else if (userEmail) {
-        // No manager on the account — email the user directly so they still have a record.
-        note = 'No manager on file — sent to you only.';
-        await sendMail({ graph, fromUserId: userAadId, to: [userEmail], subject, htmlBody });
-        sent = true;
-      } else {
-        note = 'Neither manager nor user email could be resolved — nothing sent.';
-      }
+      await work();
     } catch (err) {
-      const msg = (err as any)?.message ?? String(err);
-      console.error('[Completion] sendMail failed:', msg);
-      note = `Email could not be sent right now: ${msg}. You can ask me to resend later.`;
-    }
+      const network = isNetworkError(err);
+      console.error(`[${opts.label}] Deferred step failed${network ? ' (network)' : ''}:`, (err as any)?.message ?? err);
 
-    const cardPayload: CardPayload = {
-      type: 'completionSummary',
-      roleTitle: payload.roleTitle,
-      managerName,
-      managerEmail,
-      userEmail,
-      totalTimeMinutes: payload.totalTimeMinutes,
-      coursesCompleted: payload.coursesCompleted,
-      subject,
-      sent,
-      note,
-      footer: sent
-        ? "You did it — that's a huge career milestone. 🎉 Ready to set your next goal when you are."
-        : "Your progress is fully saved. Ping me and I'll retry the email.",
-    };
-    // Render deterministically via the shared card renderer.
-    try {
-      const { attachments } = extractCards('```card\n' + JSON.stringify(cardPayload) + '\n```');
-      if (attachments.length) {
-        await turnContext.sendActivity(MessageFactory.attachment(attachments[0]));
-      } else {
-        await turnContext.sendActivity(MessageFactory.attachment(buildMessageCard(
-          `Career plan complete! ${sent ? '📧 Email sent.' : '📧 ' + (note ?? 'Email not sent.')}`,
-        )));
+      let restored = false;
+      const cardMessageId = (context.activity as any).replyToId;
+      try {
+        const attachment = cardMessageId ? opts.restore?.(delivered) : undefined;
+        if (attachment) {
+          await context.updateActivity({ type: 'message', id: cardMessageId, attachments: [attachment] } as any);
+          restored = true;
+          console.log(`[${opts.label}] Card unlocked for retry (id=${cardMessageId}).`);
+        }
+      } catch (restoreErr) {
+        console.warn(`[${opts.label}] Could not unlock the card (non-fatal):`, (restoreErr as any)?.message ?? restoreErr);
       }
-    } catch (err) {
-      console.error('[Completion] Failed to render completion card:', (err as any)?.message ?? err);
+
+      const reason = network ? ' — I lost the connection to Microsoft 365 for a moment' : '';
+      const text = `Sorry — I couldn't ${opts.action} just now${reason}. ${opts.retryHint(restored)}`;
+      // The same outage can also break this reply, so try twice before giving up.
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          await context.sendActivity(MessageFactory.attachment(buildMessageCard(text)));
+          return;
+        } catch (sendErr) {
+          if (attempt === 2) {
+            console.error(`[${opts.label}] Could not tell the user about the failure:`, (sendErr as any)?.message ?? sendErr);
+          } else {
+            await new Promise((r) => setTimeout(r, 3000));
+          }
+        }
+      }
     }
   }
 
@@ -620,11 +803,19 @@ export class MyAgent extends AgentApplication<TurnState> {
           if (ctx.activity.from) {
             (ctx.activity.from as any).aadObjectId = aadObjectId;
           }
-          console.log(`[Proactive] Continuing conversation for aadObjectId=${aadObjectId} (convId=${convId})`);
+          const hasAgentIdentity = !!(ctx.activity.recipient as any)?.agenticAppId;
+          console.log(`[Proactive] Continuing conversation for aadObjectId=${aadObjectId} (convId=${convId}, agentIdentity=${hasAgentIdentity ? 'present' : 'missing'})`);
           // Deterministic Stage 4-SYNC — no LLM turn. Reads UserState + LearningPortalStatus,
           // diffs, writes changes, and either shows progress card or emits the next-queued quiz.
-          await sendPreface(ctx, preface);
-          await handleSyncProgress(ctx, this.authorization, aadObjectId);
+          // Traced as an event-triggered run (EventToAgent): the input describes the portal
+          // event and the caller is the employee whose learning-portal row changed.
+          const eventInput = `Learning portal event: course ${courseId ?? '(unspecified)'}${status ? ` is now ${status}` : ' updated'} for this user`;
+          await this.runObserved(ctx, eventInput,
+            { name: 'sync_progress', description: 'Sync learning progress after a learning-portal update and quiz newly completed courses', args: { courseId, status } },
+            async () => {
+              await sendPreface(ctx, preface);
+              await handleSyncProgress(ctx, this.authorization, aadObjectId);
+            });
         },
         [], // don't require any OAuth handler to sign in — runtime Graph uses agentic auth
         { type: 'message' as any, text: syntheticText },
@@ -637,62 +828,138 @@ export class MyAgent extends AgentApplication<TurnState> {
     }
   }
 
+  // A365 Observability — best-effort instrumentation (verify against official sample)
   /**
-   * Preloads or refreshes the Observability token used by the Agent 365 Observability exporter.
-   *
-   * Behavior:
-   * - If the environment variable `Use_Custom_Resolver` is set to `true`, this method exchanges an
-   *   AAU token using the agent's authorization and stores it in the local `tokenCache`, keyed by
-   *   `agentId`/`tenantId` via `createAgenticTokenCacheKey`.
-   * - Otherwise, it refreshes the built-in `AgenticTokenCacheInstance` by invoking
-   *   `RefreshObservabilityToken`, which is used by the default token resolver configured in the client.
-   *
-   * Notes:
-   * - Token acquisition failures are non-fatal for this sample and should not block the user flow.
-   * - `agentId` and `tenantId` are derived from the current `TurnContext` activity recipient.
-   * - Uses `getObservabilityAuthenticationScope()` to obtain the exporter auth scopes.
-   *
-   * @param turnContext The current turn context containing activity and identity metadata.
+   * Agent / caller / request details for this turn's spans. Identity is resolved live from the
+   * turn's recipient (agentic instance + blueprint). The env agent id is only a fallback when it
+   * isn't the blueprint id — a blueprint can't export over the S2S route.
    */
-  private async preloadObservabilityToken(turnContext: TurnContext): Promise<void> {
-    const agentId = turnContext?.activity?.recipient?.agenticAppId ?? '';
-    const tenantId = turnContext?.activity?.recipient?.tenantId ?? '';
-
-    // Token acquisition here is best-effort and MUST be non-fatal: a transient network
-    // failure (e.g. "fetch failed" reaching the A365 token endpoint) must never crash the
-    // user's turn. Catch and log instead of letting it bubble to onTurnError.
-    try {
-      // Set Use_Custom_Resolver === 'true' to use a custom token resolver and a custom token cache (see token-cache.ts).
-      // Otherwise: use the default AgenticTokenCache via RefreshObservabilityToken.
-      if (process.env.Use_Custom_Resolver === 'true') {
-        const aauToken = await this.authorization.exchangeToken(turnContext, 'agentic', {
-          scopes: getObservabilityAuthenticationScope()
-        });
-
-        console.log(`Preloaded Observability token for agentId=${agentId}, tenantId=${tenantId}`);
-        const cacheKey = createAgenticTokenCacheKey(agentId, tenantId);
-        tokenCache.set(cacheKey, aauToken?.token || '');
-      } else {
-        // Preload/refresh the observability token into the built-in AgenticTokenCache.
-        // We don't immediately need the token here, and if acquisition fails we continue (non-fatal for this demo sample).
-        await AgenticTokenCacheInstance.RefreshObservabilityToken(
-          agentId,
-          tenantId,
-          turnContext,
-          this.authorization,
-          getObservabilityAuthenticationScope()
-        );
-      }
-    } catch (error) {
-      console.warn('Observability token preload failed (non-fatal, continuing):', (error as any)?.message ?? error);
-    }
+  private observabilityDetails(turnContext: TurnContext, content: string): { agentDetails: AgentDetails; callerDetails: CallerDetails; request: A365Request } {
+    const recipient = turnContext.activity?.recipient as any;
+    const from = turnContext.activity?.from as any;
+    const envAgentId = process.env.agent365Observability__agentId;
+    const fallbackAgentId = envAgentId && envAgentId !== process.env.agent365Observability__agentBlueprintId ? envAgentId : undefined;
+    const agentDetails: AgentDetails = {
+      // Empty when the turn has no agent identity (e.g. Playground): the exporter then drops the
+      // spans quietly instead of requesting a token for an identity that doesn't exist.
+      agentId: recipient?.agenticAppId || fallbackAgentId || '',
+      agentName: process.env.agent365Observability__agentName || 'Employee Career Coach',
+      agentDescription: process.env.agent365Observability__agentDescription || 'Employee Career Coach',
+      agentAUID: recipient?.agenticUserId || undefined,
+      agentBlueprintId: recipient?.agenticAppBlueprintId || process.env.agent365Observability__agentBlueprintId || undefined,
+      tenantId: recipient?.tenantId || process.env.agent365Observability__tenantId || undefined,
+    };
+    const callerDetails: CallerDetails = {
+      userDetails: {
+        userId: from?.aadObjectId || from?.id || '',
+        userName: from?.name || '',
+        userEmail: typeof from?.id === 'string' && from.id.includes('@') ? from.id : undefined,
+      },
+    };
+    const request: A365Request = {
+      content,
+      conversationId: observabilityConversationId(turnContext),
+      channel: { name: turnContext.activity?.channelId } as Channel,
+    };
+    return { agentDetails, callerDetails, request };
   }
+
+  /** Starts the InvokeAgentScope (invoke_agent span) for a turn. */
+  private startInvokeAgentScope(turnContext: TurnContext, userMessage: string): InvokeAgentScope {
+    const { agentDetails, callerDetails, request } = this.observabilityDetails(turnContext, userMessage);
+    const scopeDetails: InvokeAgentScopeDetails = {
+      endpoint: { host: process.env.WEBSITE_HOSTNAME || process.env.HOST || 'localhost', port: Number(process.env.PORT) || 3978 },
+    };
+    const scope = InvokeAgentScope.start(request, scopeDetails, agentDetails, callerDetails);
+    scope.recordInputMessages([userMessage]);
+    return scope;
+  }
+
+  /**
+   * Runs a code-handled step with the same observability shape as an LLM turn:
+   * baggage → invoke_agent → (optional) execute_tool. The input and every message the agent
+   * sends are recorded as the run's input / output messages, so these turns reach Defender /
+   * Purview / the admin center just like LLM turns. Pass `tool: null` when the work already
+   * creates its own child spans (e.g. LLM calls). Errors are recorded and rethrown.
+   */
+  private async runObserved(
+    turnContext: TurnContext,
+    input: string,
+    tool: { name: string; description: string; args?: Record<string, unknown> } | null,
+    work: () => Promise<unknown>,
+  ): Promise<void> {
+    const outputs: string[] = [];
+    turnContext.onSendActivities(async (_ctx, activities, next) => {
+      for (const a of activities) {
+        const summary = describeOutgoing(a);
+        if (summary) outputs.push(summary);
+      }
+      return next();
+    });
+    const baggageScope = BaggageBuilderUtils.fromTurnContext(new BaggageBuilder(), turnContext as any)
+      .conversationId(observabilityConversationId(turnContext))
+      .sessionDescription(observabilitySessionDescription(turnContext))
+      .build();
+    await baggageScope.run(async () => {
+      const invokeScope = this.startInvokeAgentScope(turnContext, input);
+      try {
+        await invokeScope.withActiveSpanAsync(async () => {
+          if (!tool) {
+            await work();
+            return;
+          }
+          const { agentDetails, callerDetails, request } = this.observabilityDetails(turnContext, input);
+          const toolScope = ExecuteToolScope.start(request, {
+            toolName: tool.name,
+            description: tool.description,
+            toolType: 'function',
+            toolCallId: `${tool.name}-${Date.now()}`,
+            arguments: tool.args ?? {},
+          }, agentDetails, callerDetails.userDetails);
+          try {
+            await toolScope.withActiveSpanAsync(work);
+            toolScope.recordResponse(outputs.length ? outputs.join('\n---\n') : 'completed');
+          } catch (err) {
+            toolScope.recordError(err as Error);
+            throw err;
+          } finally {
+            toolScope.dispose();
+          }
+        });
+        invokeScope.recordOutputMessages(outputs.length ? outputs : ['(no message sent)']);
+      } catch (err) {
+        invokeScope.recordError(err as Error);
+        throw err;
+      } finally {
+        invokeScope.dispose();
+      }
+    });
+  }
+
 
   async handleAgentNotificationActivity(context: TurnContext, state: TurnState, agentNotificationActivity: AgentNotificationActivity) {
     switch (agentNotificationActivity.notificationType) {
-      case NotificationType.EmailNotification:
-        await this.handleEmailNotification(context, state, agentNotificationActivity);
+      case NotificationType.EmailNotification: {
+        if (isBounceEmail(context.activity, agentNotificationActivity.emailNotification?.htmlBody)) {
+          console.log(`[Email] Ignored bounce / non-delivery email from '${context.activity.from?.name ?? 'unknown'}' — no reply sent.`);
+          break;
+        }
+        // Trace the whole email run (invoke_agent) so its LLM calls have a root span and the
+        // run is eligible for Defender / Purview / admin-center reporting. Like a Teams turn, the
+        // input is the user's message (the email text, quoted history removed).
+        const sender = context.activity.from?.name || 'unknown sender';
+        // One conversation per email thread in Activity (the per-message conversation id changes each email).
+        setObservabilityConversationId(context, agentNotificationActivity.emailNotification?.conversationId);
+        const emailInput = extractEmailText(context.activity.text, agentNotificationActivity.emailNotification?.htmlBody)
+          || `Email from ${sender}`;
+        try {
+          await this.runObserved(context, emailInput, null,
+            () => this.handleEmailNotification(context, state, agentNotificationActivity));
+        } catch (err) {
+          console.error('[Email] Email notification run failed:', (err as any)?.message ?? err);
+        }
         break;
+      }
       case NotificationType.AgentLifecycleNotification:
         // Lifecycle events (e.g. agent instance created during onboarding) are one-way system
         // notifications delivered to a system conversation. Replying is not allowed and returns
@@ -711,35 +978,85 @@ export class MyAgent extends AgentApplication<TurnState> {
 
   private async handleEmailNotification(context: TurnContext, state: TurnState, activity: AgentNotificationActivity): Promise<void> {
     const emailNotification = activity.emailNotification;
+    const emailText = extractEmailText(context.activity.text, emailNotification?.htmlBody);
+    const reply = async (html: string): Promise<void> => {
+      try {
+        await context.sendActivity(createEmailResponseActivity(html));
+      } catch (err) {
+        console.warn('[Email] Could not send the email reply (non-fatal):', (err as any)?.message ?? err);
+      }
+    };
 
-    if (!emailNotification) {
-      const errorResponse = createEmailResponseActivity('I could not find the email notification details.');
-      await context.sendActivity(errorResponse);
+    // Only people in this organization get a conversation, scoped to their own plan. Anyone can
+    // email the agent, so unknown / external / guest senders are ignored (no reply, no data).
+    const from = context.activity.from as any;
+    const recipient = context.activity.recipient as any;
+    const senderAddress = String(from?.id ?? '').trim();
+    if (!senderAddress || senderAddress.toLowerCase() === String(recipient?.id ?? '').toLowerCase()) return;
+    let sender: { id?: string; displayName?: string; userType?: string } | null = null;
+    try {
+      const graph = getAgenticGraphClient(context, this.authorization);
+      sender = await graph.api(`/users/${encodeURIComponent(senderAddress)}`).select('id,displayName,userType').get();
+    } catch (err) {
+      console.warn('[Email] Sender lookup failed:', (err as any)?.message ?? err);
+    }
+    if (!sender?.id || (sender.userType && sender.userType !== 'Member')) {
+      console.warn(`[Email] Ignored email from a sender outside the organization — no reply sent.`);
       return;
+    }
+    // Same identity fields a Teams turn carries, so the conversation is scoped to this user's plan.
+    from.aadObjectId = sender.id;
+    if (sender.displayName) from.name = sender.displayName;
+    const displayName = sender.displayName || from?.name || 'there';
+
+    if (!emailText) {
+      await reply(`<p>Hi ${displayName.split(' ')[0]}, your email looks empty — what would you like help with? 🙂</p>`);
+      return;
+    }
+    console.log(`[Email] Conversation turn from '${displayName}' (${emailText.length} chars).`);
+
+    // The activity conversation id changes with every email; the email thread id is stable.
+    const threadKey = `email:${emailNotification?.conversationId || context.activity.conversation?.id || ''}`;
+
+    // "Save it" → save the plan proposed earlier in this thread with the same code as the Teams Save button.
+    if (isSavePlanIntent(emailText)) {
+      const pending = await getPendingPlan(threadKey, sender.id);
+      if (pending) {
+        console.log(`[Email] Saving plan "${pending.roleTitle}" from this thread's planReview.`);
+        try {
+          const result = await savePlan(context, this.authorization, savePlanInputFromReview(pending, sender.id, displayName));
+          await clearPendingPlan(threadKey);
+          const intro = result.saved
+            ? `<p>Your <b>${pending.roleTitle}</b> plan is saved! 🎉 Tell me when you complete a course and I'll track your progress.</p>`
+            : markdownToHtml(result.message ?? '');
+          await reply(intro + cardPayloadToHtml(result.card));
+        } catch (error) {
+          console.error('[Email] Plan save failed:', (error as any)?.message ?? error);
+          await reply('<p>Sorry — I couldn\'t save your plan just now. Please reply "Save it" again in a moment.</p>');
+        }
+        return;
+      }
+      console.log('[Email] Save requested but no pending plan for this thread — handing to the LLM.');
     }
 
     try {
-      const client: Client = await getClient(this.authorization, MyAgent.authHandlerName, context);
-      const runCtx = { turnContext: context, authorization: this.authorization };
-
-      // First, retrieve the email content
-      const emailContent = await client.invokeAgentWithScope(
-        `You have a new email from ${context.activity.from?.name} with id '${emailNotification.id}', ` +
-        `ConversationId '${emailNotification.conversationId}'. Please retrieve this message and return it in text format.`,
-        runCtx,
-      );
-
-      // Then summarize the email SAFELY. The body is untrusted sender content, so we use a
-      // no-tools summarization path that treats it strictly as quoted data — a crafted email
-      // must never be able to drive tool calls, SharePoint reads/writes, or data exfiltration.
-      const response = await summarizeEmailSafely(emailContent);
-
-      const emailResponseActivity = createEmailResponseActivity(response || 'I have processed your email but do not have a response at this time.');
-      await context.sendActivity(emailResponseActivity);
+      // Same Career Coach LLM, tools and rules as Teams. The email thread id keys the client
+      // cache, so replies in the thread keep the conversation history. With no history (first
+      // email, or after a restart), the quoted thread below the reply restores the context.
+      const quotedHistory = hasClient(threadKey) ? '' : extractQuotedHistory(context.activity.text, emailNotification?.htmlBody);
+      if (quotedHistory) console.log(`[Email] No history for this thread — using ${quotedHistory.length} chars of quoted email history.`);
+      const client: Client = await getClient(this.authorization, MyAgent.authHandlerName, context, displayName, threadKey);
+      const response = await client.invokeAgentWithScope(emailTurnPrompt(emailText, quotedHistory), { turnContext: context, authorization: this.authorization });
+      const plan = findPlanReview(response);
+      if (plan) await putPendingPlan(threadKey, sender.id, plan);
+      let html = llmResponseToEmailHtml(response, displayName);
+      if (takeBlockedCompletions(context).length) {
+        html += '<p>📝 Courses only count as complete after their quick quiz — open <b>Career Coach</b> in Microsoft Teams and tell me which courses you finished to take it.</p>';
+      }
+      await reply(html);
     } catch (error) {
-      console.error('Email notification error:', error);
-      const errorResponse = createEmailResponseActivity('Unable to process your email at this time.');
-      await context.sendActivity(errorResponse);
+      console.error('Email notification error:', (error as any)?.message ?? error);
+      await reply('<p>Sorry — I couldn\'t process your email just now. Please try again, or message me in Microsoft Teams.</p>');
     }
   }
   /**

@@ -17,11 +17,13 @@ src/**/*.js.map
 # generated at first `a365` run — contains tenant/agent IDs
 a365.config.json
 a365.generated.config.json
+.a365-workspace-detection.local.json
 
 # runtime state + backups
 .proactive-storage.json
 .proactive-refs.json
 .sp-subscription.json
+.email-plans.json
 backups/
 
 # dev logs

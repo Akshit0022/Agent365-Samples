@@ -6,9 +6,17 @@
 import { configDotenv } from 'dotenv';
 configDotenv();
 
+// A365 Observability — best-effort instrumentation (verify against official sample)
+// Initialize the Microsoft OpenTelemetry distro before the agent/LLM modules load.
+import { setObservabilityConnection } from './telemetry';
+
 import { AuthConfiguration, authorizeJWT, CloudAdapter, loadAuthConfigFromEnv, Request } from '@microsoft/agents-hosting';
 import express, { Response } from 'express'
 import { agentApplication } from './agent';
+
+// The observability token resolver mints app-only export tokens from the hosting connection
+// (the blueprint credential), so hand it the adapter's default connection.
+setObservabilityConnection(() => (agentApplication.adapter as CloudAdapter).connectionManager.getDefaultConnection());
 
 // Safety net: background activities (e.g. typing indicators, replies to system
 // notifications) can reject asynchronously. Without these guards a single 502 from
@@ -30,6 +38,14 @@ console.log(`Environment: NODE_ENV=${process.env.NODE_ENV}, isDevelopment=${isDe
 
 const server = express()
 server.use(express.json())
+
+// TEMPORARY diagnostic logger — logs every inbound request before any auth/route
+// matching, so we can see whether Teams/A365 is reaching this endpoint at all.
+server.use((req, _res, next) => {
+  const auth = req.headers['authorization'] ? 'auth=yes' : 'auth=no';
+  console.log(`[req] ${req.method} ${req.url} ${auth} ua="${req.headers['user-agent'] ?? ''}"`);
+  next();
+});
 
 // Health endpoint - placed BEFORE auth middleware so it doesn't require authentication
 server.get('/api/health', (req, res: Response) => {

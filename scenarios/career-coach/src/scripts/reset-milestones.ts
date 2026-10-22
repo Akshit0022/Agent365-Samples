@@ -17,7 +17,7 @@ configDotenv();
 
 import 'isomorphic-fetch';
 import { getGraphClient } from '../graph-service';
-import { readUserState, upsertUserState } from '../career-coach-service';
+import { readUserState, readPreviousPlans, upsertUserState } from '../career-coach-service';
 
 async function main(): Promise<void> {
     const userAADId = (process.argv[2] || '').trim();
@@ -27,20 +27,28 @@ async function main(): Promise<void> {
         process.exit(2);
     }
     const graph = getGraphClient();
-    const rec = await readUserState(graph, userAADId);
+    // Resetting the 100% guard reopens the latest Completed goal when there's no active one.
+    let rec = await readUserState(graph, userAADId);
+    if (!rec && which !== 'milestone80') {
+        rec = (await readPreviousPlans(graph, userAADId)).find((p) => p.state.PlanStatus === 'Completed') ?? null;
+        if (rec) console.log(`[reset:milestones] No active goal — reopening completed "${rec.state.TargetRole}" goal.`);
+    }
     if (!rec) {
         console.error(`[reset:milestones] No UserState row found for ${userAADId}`);
         process.exit(3);
     }
-    const before = { m80: rec.state.Milestone80Fired, c100: rec.state.Completion100Fired };
+    const resetCompletion = !which || which === 'completion100';
+    const before = { m80: rec.state.Milestone80Fired, c100: rec.state.Completion100Fired, status: rec.state.PlanStatus };
     const nextState = {
         ...rec.state,
         Milestone80Fired: which && which !== 'milestone80' ? rec.state.Milestone80Fired : false,
-        Completion100Fired: which && which !== 'completion100' ? rec.state.Completion100Fired : false,
+        Completion100Fired: resetCompletion ? false : rec.state.Completion100Fired,
+        PlanStatus: resetCompletion ? 'Active' as const : rec.state.PlanStatus,
+        PlanCompletedDate: resetCompletion ? '' : rec.state.PlanCompletedDate,
     };
     await upsertUserState(graph, nextState, rec);
     console.log('[reset:milestones] Before:', before);
-    console.log('[reset:milestones] After :', { m80: nextState.Milestone80Fired, c100: nextState.Completion100Fired });
+    console.log('[reset:milestones] After :', { m80: nextState.Milestone80Fired, c100: nextState.Completion100Fired, status: nextState.PlanStatus });
     console.log('[reset:milestones] ✅ Done. Say "check my progress" in Teams to re-fire.');
 }
 
