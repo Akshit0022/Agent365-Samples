@@ -35,7 +35,8 @@ import {
     generateQuizQuestions, gradeShortAnswers, composeCompletionEmail, ShortGradeInput,
 } from './llm-tasks';
 import { getAgenticGraphClient, getMyManager, getMyProfile, sendMail } from './graph-service';
-import { getQuiz, putQuiz, bumpAttempts, clearQuiz, markGraded, unmarkGraded, wasGraded, queueQuizzes, dequeueQuiz, peekQueuedQuizzes } from './quiz-cache';
+import { getQuiz, getOrCreateQuiz, bumpAttempts, clearQuiz, markGraded, unmarkGraded, wasGraded, queueQuizzes, dequeueQuiz, peekQueuedQuizzes } from './quiz-cache';
+import { withUserLock } from './user-lock';
 
 // ============================================================================
 // STAGE 1 helper — build a skillPath card for a role name (LLM path calls this too).
@@ -250,6 +251,15 @@ export async function savePlan(
     authorization: Authorization,
     input: SavePlanInput,
 ): Promise<SavePlanResult> {
+    // Serialised per user: the read-then-write below must not interleave with a sync or quiz grade.
+    return withUserLock(input.userAADId, () => savePlanLocked(context, authorization, input));
+}
+
+async function savePlanLocked(
+    context: TurnContext,
+    authorization: Authorization,
+    input: SavePlanInput,
+): Promise<SavePlanResult> {
     const graph = getAgenticGraphClient(context, authorization);
 
     // Guard: never let a repeat Save (old card, double click) wipe a plan that already has
@@ -371,14 +381,21 @@ export async function handleSyncProgress(
     userAADId: string,
 ): Promise<void> {
     const graph = getAgenticGraphClient(context, authorization);
-    const userRecord = await readUserState(graph, userAADId);
-    if (!userRecord) {
+    // The read-diff-write happens under the user lock, so a quiz result persisted by a concurrent
+    // submission is never overwritten by a stale snapshot. Sending cards happens after release.
+    const synced = await withUserLock(userAADId, async () => {
+        const userRecord = await readUserState(graph, userAADId);
+        if (!userRecord) return null;
+        const portal = await readLearningPortalStatus(graph, userAADId);
+        const { updatedState, newlyCompleted } = diffPortalAgainstPlan(userRecord.state, portal);
+        await upsertUserState(graph, updatedState, userRecord);
+        return { updatedState, newlyCompleted, portal };
+    });
+    if (!synced) {
         await sendPlain(context, await noActiveGoalMessage(graph, userAADId));
         return;
     }
-    const portal = await readLearningPortalStatus(graph, userAADId);
-    const { updatedState, newlyCompleted } = diffPortalAgainstPlan(userRecord.state, portal);
-    await upsertUserState(graph, updatedState, userRecord);
+    const { updatedState, newlyCompleted, portal } = synced;
 
     // Any newly-completed course → build quiz + render.
     const nextPending = pickNextPendingQuiz(updatedState, portal);
@@ -422,12 +439,9 @@ export async function emitQuizFor(
         await sendPlain(context, `I couldn't find course ${courseId} in the catalog. Skipping the quiz.`);
         return;
     }
-    // Reuse a cached quiz if we recently generated it (e.g., after a failed submit).
-    let questions = getQuiz(userAADId, courseId);
-    if (!questions || questions.length === 0) {
-        questions = await generateQuizQuestions(course);
-        putQuiz(userAADId, courseId, questions);
-    }
+    // Reuse a cached quiz if we recently generated it (e.g., after a failed submit). Concurrent
+    // callers share one in-flight generation so every card sent is graded against the same key.
+    const questions = await getOrCreateQuiz(userAADId, courseId, () => generateQuizQuestions(course));
     // A freshly-sent card is a new attempt: allow it to be submitted, and drop it from the queue.
     unmarkGraded(userAADId, courseId);
     dequeueQuiz(userAADId, courseId);
@@ -698,54 +712,57 @@ async function handleQuizSubmitInner(
 
     const summary = summarizeGrading(graded);
 
-    // Load user + course context for persistence.
-    const userRecord = await readUserState(graph, input.userAADId);
-    if (!userRecord) {
-        await sendPlain(context, "I couldn't find your plan to record the quiz result. Save a plan first.");
-        return;
-    }
-    const catalog = await readLearningCatalog(graph, userRecord.siteId);
-    const course = catalog.find((c) => c.CourseId === input.courseId);
-    if (!course) {
-        await sendPlain(context, `I couldn't find course ${input.courseId} in the catalog to record the quiz.`);
-        return;
-    }
-    // Counted only once the reads succeed, so a network failure above isn't an attempt.
-    const attempts = bumpAttempts(input.userAADId, input.courseId) || 1;
-    const lp = userRecord.state.LearningProgress.find((l) => l.courseId === input.courseId);
-    const courseTitle = lp?.courseTitle ?? course.Title;
+    // Load user + course context and persist, as one critical section per user. A concurrent sync, or
+    // a submission for another course, can't read the same plan and overwrite this result (or lose theirs).
+    const persisted = await withUserLock(input.userAADId, async () => {
+        const userRecord = await readUserState(graph, input.userAADId);
+        if (!userRecord) return { ok: false as const, problem: "I couldn't find your plan to record the quiz result. Save a plan first." };
+        const catalog = await readLearningCatalog(graph, userRecord.siteId);
+        const course = catalog.find((c) => c.CourseId === input.courseId);
+        if (!course) return { ok: false as const, problem: `I couldn't find course ${input.courseId} in the catalog to record the quiz.` };
+        // Counted only once the reads succeed, so a network failure above isn't an attempt.
+        const attempts = bumpAttempts(input.userAADId, input.courseId) || 1;
+        const lp = userRecord.state.LearningProgress.find((l) => l.courseId === input.courseId);
+        const courseTitle = lp?.courseTitle ?? course.Title;
 
-    const quizResult: UserLearningQuizSummary = {
-        attemptDate: nowIso(),
-        score: summary.score,
-        passed: summary.passed,
-        topicTagsWrong: summary.topicTagsWrong,
-        attempts,
-    };
-
-    // WRITE #1 — QuizResponses row.
-    try {
-        await appendQuizResponse(graph, {
-            userAADId: input.userAADId,
-            courseId: input.courseId,
-            courseTitle,
-            skillId: input.skillId || (String(course.SkillIds ?? '').split(';')[0] ?? ''),
-            attemptDate: quizResult.attemptDate,
+        const quizResult: UserLearningQuizSummary = {
+            attemptDate: nowIso(),
             score: summary.score,
             passed: summary.passed,
+            topicTagsWrong: summary.topicTagsWrong,
             attempts,
-            feedback: graded,
-        }, userRecord.siteId);
-    } catch (err) {
-        console.warn('[QuizSubmit] appendQuizResponse failed (non-fatal):', (err as any)?.message ?? err);
-    }
+        };
 
-    // WRITE #2 — UserState update.
-    const previousOverall = userRecord.state.OverallProgress;
-    const nextState = summary.passed
-        ? applyQuizPass(userRecord.state, input.courseId, quizResult, course)
-        : applyQuizFail(userRecord.state, input.courseId, quizResult);
-    await upsertUserState(graph, nextState, userRecord);
+        // WRITE #1 — QuizResponses row.
+        try {
+            await appendQuizResponse(graph, {
+                userAADId: input.userAADId,
+                courseId: input.courseId,
+                courseTitle,
+                skillId: input.skillId || (String(course.SkillIds ?? '').split(';')[0] ?? ''),
+                attemptDate: quizResult.attemptDate,
+                score: summary.score,
+                passed: summary.passed,
+                attempts,
+                feedback: graded,
+            }, userRecord.siteId);
+        } catch (err) {
+            console.warn('[QuizSubmit] appendQuizResponse failed (non-fatal):', (err as any)?.message ?? err);
+        }
+
+        // WRITE #2 — UserState update.
+        const previousOverall = userRecord.state.OverallProgress;
+        const nextState = summary.passed
+            ? applyQuizPass(userRecord.state, input.courseId, quizResult, course)
+            : applyQuizFail(userRecord.state, input.courseId, quizResult);
+        await upsertUserState(graph, nextState, userRecord);
+        return { ok: true as const, userRecord, course, courseTitle, previousOverall, nextState };
+    });
+    if (!persisted.ok) {
+        await sendPlain(context, persisted.problem);
+        return;
+    }
+    const { userRecord, course, courseTitle, previousOverall, nextState } = persisted;
 
     // Render the quizResult card.
     const feedbackCard = graded.map((g) => ({
@@ -839,11 +856,13 @@ async function fireMilestone80(
         areasToStrengthen: agg.areasToStrengthen,
         footer: `You're at ${state.OverallProgress}% — an incredible milestone. Keep the momentum going! 🚀`,
     });
-    // Persist the guard.
-    const record = await readUserState(graph, userAADId);
-    if (record) {
-        await upsertUserState(graph, { ...record.state, Milestone80Fired: true }, record);
-    }
+    // Persist the guard (re-read under the user lock so it can't clobber a concurrent update).
+    await withUserLock(userAADId, async () => {
+        const record = await readUserState(graph, userAADId);
+        if (record) {
+            await upsertUserState(graph, { ...record.state, Milestone80Fired: true }, record);
+        }
+    });
 }
 
 // ============================================================================
@@ -958,19 +977,21 @@ async function fireCompletion100(
     // retry can succeed (say "check my progress"). Once Completed, the next chat starts fresh
     // with the welcome card; the goal stays in UserState as history ("show my previous goals").
     if (sent) {
-        const record = await readUserState(graph, userAADId);
-        if (record) {
-            await upsertUserState(graph, {
-                ...record.state,
-                Completion100Fired: true,
-                PlanStatus: 'Completed',
-                PlanCompletedDate: today(),
-                // Cache the manager we resolved (freshly) so next reads have it too.
-                ManagerName: managerName ?? record.state.ManagerName,
-                ManagerEmail: managerEmail ?? record.state.ManagerEmail,
-            }, record);
-            console.log(`[Completion100] Goal "${record.state.TargetRole}" marked Completed.`);
-        }
+        await withUserLock(userAADId, async () => {
+            const record = await readUserState(graph, userAADId);
+            if (record) {
+                await upsertUserState(graph, {
+                    ...record.state,
+                    Completion100Fired: true,
+                    PlanStatus: 'Completed',
+                    PlanCompletedDate: today(),
+                    // Cache the manager we resolved (freshly) so next reads have it too.
+                    ManagerName: managerName ?? record.state.ManagerName,
+                    ManagerEmail: managerEmail ?? record.state.ManagerEmail,
+                }, record);
+                console.log(`[Completion100] Goal "${record.state.TargetRole}" marked Completed.`);
+            }
+        });
     } else {
         console.warn('[Completion100] Email not sent — leaving Completion100Fired=false so a retry can succeed.');
     }

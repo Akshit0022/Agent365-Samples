@@ -6,11 +6,13 @@
  *
  * Flow:
  *   1. On agent startup, `ensureSubscription()` is called.
- *      - If a subscription file exists AND the notificationUrl still matches AND the
- *        expiration is > 5 min away → PATCH to extend it.
+ *      - If a subscription file exists AND the notificationUrl, resource and notification secret
+ *        (PORTAL_EVENT_SECRET, compared by hash) still match AND it can be renewed → PATCH to extend it.
  *      - Otherwise → DELETE the stale one (if any), then CREATE a fresh one.
  *   2. A background timer runs every 30 min and calls `renewSubscription()` so the sub
- *      never expires while the process is running.
+ *      never expires while the process is running. If Graph reports the subscription gone (or its
+ *      saved expiry has passed, e.g. after a long outage), the timer re-enters `ensureSubscription()`
+ *      to create a fresh one instead of retrying the dead id forever.
  *   3. On graceful shutdown we DON'T delete the sub (Graph will time it out naturally in
  *      ~60 min if the agent stays down).
  *
@@ -20,6 +22,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import {
     createSubscription,
     deleteSubscription,
@@ -40,6 +43,12 @@ interface PersistedSub {
     resource: string;
     notificationUrl: string;
     expirationDateTime: string;
+    /** SHA-256 of the clientState the subscription was created with. Renewal can't change clientState, so a rotated secret needs a new subscription. */
+    clientStateHash?: string;
+}
+
+function fingerprint(secret: string): string {
+    return createHash('sha256').update(secret).digest('hex');
 }
 
 function readState(): PersistedSub | null {
@@ -92,9 +101,24 @@ export async function ensureSubscription(): Promise<GraphSubscription | null> {
     }
     const resource = `sites/${siteId}/lists/${listId}`;
 
-    // 1) Try to renew an existing sub that matches this notificationUrl + resource.
+    // 1) Try to renew an existing sub that matches this notificationUrl, resource AND notification secret.
+    //    Renewal only extends the expiry — Graph keeps sending the clientState the sub was created with —
+    //    so after PORTAL_EVENT_SECRET is rotated the old sub must be replaced, not renewed.
+    const secretHash = fingerprint(clientState);
     const persisted = readState();
-    if (persisted && persisted.notificationUrl === notificationUrl && persisted.resource === resource) {
+    const reusable = !!persisted
+        && persisted.notificationUrl === notificationUrl
+        && persisted.resource === resource
+        && persisted.clientStateHash === secretHash;
+    if (persisted && !reusable) {
+        const why = persisted.clientStateHash === undefined
+            ? 'saved without a notification-secret fingerprint'
+            : persisted.clientStateHash !== secretHash ? 'PORTAL_EVENT_SECRET changed' : 'notification URL or resource changed';
+        console.log(`[sub-mgr] Saved subscription is not reusable (${why}) — replacing it.`);
+        // We created it, so remove it explicitly (it would otherwise keep notifying with the old secret until it expires).
+        await deleteSubscription(persisted.subscriptionId).catch((e) => console.warn('  delete failed:', (e as any)?.message ?? e));
+    }
+    if (persisted && reusable) {
         try {
             const renewed = await renewSubscription(persisted.subscriptionId, EXPIRATION_MINUTES);
             writeState({
@@ -102,6 +126,7 @@ export async function ensureSubscription(): Promise<GraphSubscription | null> {
                 resource: renewed.resource,
                 notificationUrl: renewed.notificationUrl,
                 expirationDateTime: renewed.expirationDateTime,
+                clientStateHash: secretHash,
             });
             console.log(`[sub-mgr] Renewed existing subscription (id=${renewed.id}), expires ${renewed.expirationDateTime}`);
             startRenewTimer();
@@ -146,6 +171,7 @@ export async function ensureSubscription(): Promise<GraphSubscription | null> {
             resource: fresh.resource,
             notificationUrl: fresh.notificationUrl,
             expirationDateTime: fresh.expirationDateTime,
+            clientStateHash: secretHash,
         });
         console.log(`[sub-mgr] ✓ Subscription created (id=${fresh.id}), expires ${fresh.expirationDateTime}`);
         startRenewTimer();
@@ -156,6 +182,14 @@ export async function ensureSubscription(): Promise<GraphSubscription | null> {
         console.error('[sub-mgr]   Hint: make sure PORTAL_WEBHOOK_URL is reachable from the internet and the /api/portal-event route is running (Graph validates it during CREATE).');
         return null;
     }
+}
+
+let recreating = false;
+
+/** Graph reports a missing / expired subscription as 404 (ResourceNotFound). */
+function isSubscriptionGone(err: any): boolean {
+    const code = err?.statusCode ?? err?.code ?? '';
+    return code === 404 || code === '404' || /ResourceNotFound|not found/i.test(String(err?.message ?? ''));
 }
 
 function startRenewTimer(): void {
@@ -170,10 +204,27 @@ function startRenewTimer(): void {
                 resource: renewed.resource,
                 notificationUrl: renewed.notificationUrl,
                 expirationDateTime: renewed.expirationDateTime,
+                clientStateHash: persisted.clientStateHash,
             });
             console.log(`[sub-mgr] Auto-renewed subscription — new expiry ${renewed.expirationDateTime}`);
         } catch (err) {
-            console.warn('[sub-mgr] Auto-renew failed (will retry on next tick):', (err as any)?.message ?? err);
+            const expired = Date.parse(persisted.expirationDateTime) <= Date.now();
+            if (!isSubscriptionGone(err) && !expired) {
+                console.warn('[sub-mgr] Auto-renew failed (will retry on next tick):', (err as any)?.message ?? err);
+                return;
+            }
+            // The subscription expired or was deleted (e.g. after an outage longer than its lifetime).
+            // Retrying the same id can never succeed, so go back through the ensure/create path.
+            if (recreating) return;
+            recreating = true;
+            console.warn('[sub-mgr] Subscription is gone or expired — creating a fresh one.');
+            try {
+                await ensureSubscription();
+            } catch (e) {
+                console.warn('[sub-mgr] Re-creating the subscription failed (will retry on next tick):', (e as any)?.message ?? e);
+            } finally {
+                recreating = false;
+            }
         }
     }, RENEW_INTERVAL_MS);
 }

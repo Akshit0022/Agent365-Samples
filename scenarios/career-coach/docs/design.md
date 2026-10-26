@@ -72,7 +72,8 @@ Out of scope: acting for anyone but the signed-in user, writing to the reference
 | `llm-tasks.ts` | Narrow LLM calls with JSON output: quiz generation, short-answer grading, completion email text |
 | `cards.ts` | Adaptive Card builders and the card-block parser |
 | `email-conversation.ts`, `email-plan-store.ts` | Email text/prompt/rendering and the pending-plan store |
-| `graph-service.ts`, `subscription-manager.ts` | Graph clients, mail, change subscriptions |
+| `graph-service.ts`, `subscription-manager.ts` | Graph clients (agentic at runtime), mail, change subscriptions |
+| `user-lock.ts` | Per-user mutex serialising every `UserState` read-modify-write |
 
 ## 5. Data model (SharePoint)
 
@@ -131,10 +132,13 @@ List change → Graph notification → webhook (validated by a shared secret) �
 |---|---|
 | Prompt injection via user text, email bodies, documents, tool results | System prompt says only system instructions count; Mail/Calendar rules forbid acting on embedded instructions and limit recipients; all writes still go through code guards |
 | LLM claims progress it didn't earn | Progress guard rejects Complete / passed-quiz / skill-level writes; only the quiz grader records them |
-| LLM corrupts lifecycle data | Lifecycle columns stripped from model writes; finished goals read-only; one active goal; role switch with progress rejected |
+| LLM corrupts lifecycle data | Lifecycle columns and the manager identity stripped from model writes (under their display **and** internal names); finished goals read-only; one active goal; role switch with progress rejected |
+| LLM reads or writes another employee's data | Data tools are limited to the configured site and the five Career Coach lists; personal lists are filtered to the caller's own rows in code; new plans are bound to the caller; updates verify row ownership fail-closed and can't change the owner; chat writes are limited to `UserState` |
+| LLM redirects the completion email | `ManagerName` / `ManagerEmail` are app-managed — populated only from the directory, never from a model write |
+| Concurrent turns overwrite each other's plan changes | Every `UserState` read-modify-write runs under a per-user lock; quiz generation shares one in-flight result per user/course so a card is always graded against its own answer key |
 | LLM bypasses guards through a second SharePoint path | WorkIQ SharePoint server exposes only read tools |
 | Unknown or external email senders | Ignored; only organisation Members get replies; bounces ignored |
-| Forged webhook | Graph `clientState` / `X-Portal-Secret` must equal `PORTAL_EVENT_SECRET` |
+| Forged webhook | Graph `clientState` / `X-Portal-Secret` must equal `PORTAL_EVENT_SECRET`; a rotated secret replaces the Graph subscription (the saved subscription stores a hash of the secret) |
 | Inbound request forgery | JWT auth on `/api/messages` (disabled only with `NODE_ENV=development`) |
 | Secrets | `.env`, `a365.generated.config.json` and runtime state are git-ignored; export tokens are validated and never logged |
 
@@ -147,7 +151,7 @@ List change → Graph notification → webhook (validated by a shared secret) �
 - **Lifecycle events** from the platform are acknowledged by a top-priority route so they can't crash a turn or trigger an error-reply loop.
 - **Process-level** rejections are logged; the server stays up.
 
-Known trade-offs: the quiz answer-key cache and queue are in memory (lost on restart — the user is asked to say "check my progress" to regenerate), and the proactive map, email-plan store and subscription state are local files, which suits a single instance. Running several instances would need shared storage for these.
+Known trade-offs: the quiz answer-key cache and queue are in memory (lost on restart — the user is asked to say "check my progress" to regenerate), and the proactive map, email-plan store and subscription state are local files. The per-user lock is in-process too. All of this suits a single instance; running several instances would need shared storage and a shared lock (or conditional writes with row versions). The Graph change subscription is re-created automatically when it expires or is deleted while the process runs.
 
 ## 9. Observability design
 

@@ -395,7 +395,7 @@ Send `check my progress` in Teams (also `sync my progress`, `any updates`, `rese
 - With no active goal, the agent greets the user with the welcome card and starts a new goal. Saving a new goal creates a new row.
 - Ask *"show my previous goals"* to see the history (the LLM's `listPreviousGoals` tool).
 - **"Prep me for my 1:1"** uses the active goal. With no active goal it uses the finished goal, or asks which one when there are several. Previous goals are read-only, so a manager-asks answer is used in the brief but not saved to a finished goal.
-- `PlanStatus`, `PlanCompletedDate` and `Completion100Fired` are app-managed. The SharePoint tools strip them from LLM writes and block edits to finished goals, creating a second active goal, and changing the role of a goal that has progress.
+- `PlanStatus`, `PlanCompletedDate`, `Completion100Fired`, `ManagerName` and `ManagerEmail` are app-managed. The SharePoint tools strip them from LLM writes (also when sent under an internal column name) and block edits to finished goals, creating a second active goal, and changing the role of a goal that has progress. The model only ever sees and writes the current user's own rows, and only `UserState` can be written from chat.
 - Rows saved before these columns existed count as `Completed` once `Completion100Fired` is Yes, otherwise `Active`.
 - **Existing tenants:** re-run `npm run setup:sharepoint` once to add the `PlanStatus` and `PlanCompletedDate` columns. Until then the agent still works, falling back to `Completion100Fired`, and logs a warning.
 
@@ -471,7 +471,7 @@ Email (A365 ─────┘     ├─ 🚦 Card + message + email router
 - **Microsoft Graph** delivers change notifications when the portal updates + sends the completion email on `/me/sendMail`.
 - **WorkIQ MCP tools** (Mail, Calendar, plus SharePoint if the gateway attaches it) give the LLM M365 actions the user explicitly asks for ("email me my plan"). The WorkIQ SharePoint server is **read-only**: `client.ts` hides its write tools, so every list write goes through the guarded tools in `sharepoint-tools.ts`. Emails *sent to* the agent are still received by the A365 email notification handler in `agent.ts`. WorkIQ doesn't replace that handler. MCP servers are attached per turn and never block it — a server that can't connect is skipped.
 - **Email conversations** keep their history per email thread (keyed on the stable `emailNotification.conversationId`). If the agent has no history for a thread (e.g. after a restart), the quoted reply history in the email is passed to the LLM as context. Replying **"Save it"** saves the plan from the thread's latest plan-review card using the same code as the Teams **Save my plan** button (pending plans are kept in `.email-plans.json`). Quizzes still need Teams.
-- **Guarded writes** — `sharepoint-tools.ts` stops the LLM from marking a course Complete or raising a skill level without a passed quiz (`[ProgressGuard]`), and enforces the goal lifecycle (§8.7).
+- **Guarded writes** — `sharepoint-tools.ts` stops the LLM from marking a course Complete or raising a skill level without a passed quiz (`[ProgressGuard]`), enforces the goal lifecycle (§8.7), limits chat writes to `UserState`, scopes every personal list to the caller's own rows, and verifies row ownership before an update. Every `UserState` read-modify-write runs under a per-user lock (`user-lock.ts`).
 - **Resilient card actions** — button steps run after the invoke returns; on failure `runDeferred` in `agent.ts` tells the user, and unlocks the card when it is safe to retry.
 - **Observability** — `telemetry.ts` initialises `@microsoft/opentelemetry` (A365 exporter on the S2S route). `observability/app-token-resolver.ts` does the 3-hop FMI token exchange for the runtime agent identity; every turn (LLM, card action, email) is wrapped in `invoke_agent` / `chat` / `execute_tool` spans. `observability/conversation-id.ts` groups an email thread into one conversation.
 - **Agentic auth** — the A365 platform hands the agent its own agentic-user Graph token per turn, so `/me` is the Career Coach agent user (its own mailbox). No manual token refreshes.
@@ -493,7 +493,8 @@ src/
 ├── sharepoint-tools.ts       OpenAI Agents function tools incl. listPreviousGoals + write guards (LLM path only)
 ├── sharepoint-column-map.ts  Display-name ↔ internal-name translation
 ├── career-coach-types.ts     Shared types + SP_CONFIG + goal lifecycle (PlanStatus)
-├── quiz-cache.ts             In-memory quiz answer key store
+├── quiz-cache.ts             In-memory quiz answer key store (one in-flight generation per user/course)
+├── user-lock.ts              Per-user async mutex around every UserState read-modify-write
 ├── file-storage.ts           Disk-backed SDK Storage impl for Proactive subsystem
 ├── email-conversation.ts     Email turn prompt, quoted-history fallback, card → HTML rendering
 ├── email-plan-store.ts       Plans proposed by email, waiting for a "Save it" reply

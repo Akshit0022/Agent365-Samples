@@ -118,6 +118,13 @@ export type PlanStatus = 'Active' | 'Completed' | 'Replaced';
 export const PLAN_LIFECYCLE_FIELDS = ['PlanStatus', 'PlanCompletedDate', 'Completion100Fired'] as const;
 
 /**
+ * UserState columns the LLM can never write: the lifecycle columns plus the manager's identity. The
+ * completion email is addressed to ManagerEmail, so it is populated only by the app from the directory
+ * (`/users/{id}/manager`) — a model write could otherwise redirect the report to any address.
+ */
+export const APP_MANAGED_USERSTATE_FIELDS = [...PLAN_LIFECYCLE_FIELDS, 'ManagerName', 'ManagerEmail'] as const;
+
+/**
  * Status of a UserState row (display-name fields). Rows saved before the lifecycle columns
  * existed have no PlanStatus: they count as Completed once Completion100Fired is set.
  */

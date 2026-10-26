@@ -33,11 +33,12 @@ src/
 ├── career-coach-types.ts     Types, SP_CONFIG (list names), PlanStatus lifecycle helpers
 ├── llm-tasks.ts              Small focused LLM calls: quiz questions, short-answer grading, completion email text
 ├── cards.ts                  All Adaptive Card builders, extractCards(), renderCard()
-├── quiz-cache.ts             In-memory quiz answer keys, graded markers, pending-quiz queue
+├── quiz-cache.ts             In-memory quiz answer keys (one in-flight generation per user/course), graded markers, pending-quiz queue
+├── user-lock.ts              Per-user async mutex around every UserState read-modify-write
 ├── email-conversation.ts     Email text extraction, email prompt, card → HTML
 ├── email-plan-store.ts       Disk-backed "plan proposed by email, awaiting Save it"
-├── graph-service.ts          Graph clients (agentic + MSAL for scripts), sendMail, subscriptions
-├── subscription-manager.ts   Create/renew the Graph change subscription
+├── graph-service.ts          Graph clients (agentic at runtime; MSAL device-code for scripts and background jobs), sendMail, subscriptions
+├── subscription-manager.ts   Create / renew / re-create the Graph change subscription (replaced when the notification secret rotates)
 ├── sharepoint-column-map.ts  Display-name ↔ internal-column-name translation
 ├── file-storage.ts           Disk-backed SDK Storage (proactive subsystem)
 ├── proactive-refs.ts         AAD object id → conversation id map (disk)
@@ -124,7 +125,7 @@ Teams gives an `Action.Execute` about 10 seconds. Reads/writes to SharePoint plu
 
 ## 7. Quizzes — grade deterministically
 
-**Sending** (`emitQuizFor`): `generateQuizQuestions` (LLM, in `llm-tasks.ts`) makes 5 questions (about 3 multiple choice + 2 short answer) with answer keys and rubrics. The keys go into `quiz-cache.ts` (in memory, keyed by user + course); the card sent to the user contains **no answers**.
+**Sending** (`emitQuizFor`): `generateQuizQuestions` (LLM, in `llm-tasks.ts`) makes 5 questions (about 3 multiple choice + 2 short answer) with answer keys and rubrics. The keys go into `quiz-cache.ts` (in memory, keyed by user + course); overlapping syncs or portal events for the same course share **one** generation, so every card sent is graded against the same key. The card sent to the user contains **no answers**.
 
 **Grading** (`handleQuizSubmit` → `handleQuizSubmitInner`):
 
@@ -170,15 +171,19 @@ These make wrong LLM behaviour impossible rather than merely discouraged:
 
 | Guard | Rule |
 |---|---|
+| **Site + list allowlist** | The data tools (`listListItems`, `createListItem`, `updateListItem`) only operate on the configured Career Coach site, and only read the five Career Coach lists. Chat **writes are limited to `UserState`** — reference data, portal completions and quiz audit rows are written only by provisioning, the portal and the deterministic quiz grader |
+| **Owner scoping** | Personal lists (`UserState`, `LearningPortalStatus`, `QuizResponses`) return only the caller's own rows (`activity.from.aadObjectId`), whatever filter the model asks for. A new plan is always created for the caller (a different `UserAADId` is rejected and the caller's id is persisted). An update first reads the row **fail-closed** — unreadable or someone else's rows are refused — and `UserAADId` can never be changed. With no authenticated user, personal data is refused |
+| **Column-name canonicalization** | Every model write is rewritten to display names first (case-insensitive, internal `field_N` names included), so no guard can be bypassed through an alias; two keys for the same column are rejected |
 | **Progress guard** (`guardUserStateWrite`) | A write that would mark a course Complete, record a passed quiz, or raise a skill level is rejected with `BLOCKED …`; the courses are remembered for the turn so the app can start their quizzes |
-| **Lifecycle fields** | `PlanStatus`, `PlanCompletedDate`, `Completion100Fired` are stripped from LLM writes |
+| **App-managed fields** | `PlanStatus`, `PlanCompletedDate`, `Completion100Fired`, `ManagerName` and `ManagerEmail` are stripped from LLM writes. The manager comes only from the directory, so the model can't redirect the completion email |
 | **Finished goals** | Update of a Completed/Replaced row is rejected |
 | **One active goal** | `createListItem` on `UserState` is rejected when an active goal already exists |
 | **Role switch** | Changing `TargetRole` on a goal that has progress is rejected (the Save button keeps the old goal as history) |
 | **Visibility** | `listListItems` on `UserState` returns only the active goal; `listPreviousGoals` is the only way to see history |
+| **Per-user lock** | Every `UserState` read-modify-write (save, sync, quiz grading, milestone / completion persistence, and the model's own create / update) runs under `withUserLock` (`user-lock.ts`), so concurrent turns can't overwrite each other's changes |
 | **ID repair** | A truncated site id or a list *display name* passed as an id is replaced with the real one |
 
-`isUserStateList` falls back to asking Graph when the list-name cache is cold, so passing a raw GUID can't bypass the rules.
+`listNameOf` falls back to asking Graph when the list-name cache is cold, so passing a raw GUID can't bypass the rules.
 
 ## 12. Email
 

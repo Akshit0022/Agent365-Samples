@@ -18,10 +18,11 @@
 import { tool, type FunctionTool } from '@openai/agents';
 import type { TurnContext, Authorization } from '@microsoft/agents-hosting';
 import { Client as MsGraphClient } from '@microsoft/microsoft-graph-client';
-import { getAgenticGraphClient } from './graph-service';
-import { getColumnMap, toInternalFields, toDisplayFields } from './sharepoint-column-map';
-import { SP_CONFIG, PLAN_LIFECYCLE_FIELDS, planStatusOf } from './career-coach-types';
+import { getAgenticGraphClient, getSiteId } from './graph-service';
+import { getColumnMap, toInternalFields, toDisplayFields, canonicalizeFields } from './sharepoint-column-map';
+import { SP_CONFIG, APP_MANAGED_USERSTATE_FIELDS, planStatusOf } from './career-coach-types';
 import { readUserState, readPreviousPlans, dropMissingLifecycleColumns } from './career-coach-service';
+import { withUserLock } from './user-lock';
 
 /**
  * The per-run context passed to `run(agent, input, { context })`. Every tool below
@@ -221,22 +222,56 @@ function parseJsonArray(value: unknown): any[] {
     return [];
 }
 
-/** True when listId is the UserState list. Falls back to Graph when the list cache is cold, so a GUID can't bypass the goal-lifecycle rules. */
-async function isUserStateList(graph: MsGraphClient, siteId: string, listId: string): Promise<boolean> {
+/** The list's display name (lower-cased). Falls back to Graph when the list cache is cold, so a raw GUID can't bypass the rules. */
+async function listNameOf(graph: MsGraphClient, siteId: string, listId: string): Promise<string> {
     let name = listCacheBySite.get(siteId)?.byId.get(listId);
     if (!name) {
         try {
             const list: any = await graph.api(`/sites/${siteId}/lists/${listId}?$select=id,displayName`).get();
             if (list?.displayName) { name = String(list.displayName); rememberList(siteId, listId, name); }
-        } catch { /* unknown list: treated as not UserState; Graph reports the real error on the actual call */ }
+        } catch { /* unknown list: handled as "not a Career Coach list" by the callers; Graph reports the real error on the actual call */ }
     }
-    return (name ?? listId).toLowerCase() === SP_CONFIG.lists.userState.toLowerCase();
+    return (name ?? listId).toLowerCase();
 }
 
-/** Strips the app-managed goal-lifecycle columns from an LLM write to UserState. */
-function withoutLifecycleFields(fields: Record<string, unknown>): Record<string, unknown> {
+/** True when listId is the UserState list. */
+async function isUserStateList(graph: MsGraphClient, siteId: string, listId: string): Promise<boolean> {
+    return (await listNameOf(graph, siteId, listId)) === SP_CONFIG.lists.userState.toLowerCase();
+}
+
+/** Lists that hold one employee's private data — the model only ever sees the caller's own rows. */
+function personalListNames(): string[] {
+    return [SP_CONFIG.lists.userState, SP_CONFIG.lists.learningPortalStatus, SP_CONFIG.lists.quizResponses].map((n) => n.toLowerCase());
+}
+
+/** Every list this sample owns. The model's data tools never touch any other list. */
+function careerCoachListNames(): string[] {
+    return [...personalListNames(), SP_CONFIG.lists.competencyFramework.toLowerCase(), SP_CONFIG.lists.learningCatalog.toLowerCase()];
+}
+
+// The data tools (list / create / update) only ever operate on the configured Career Coach site.
+let configuredSite: Promise<string> | null = null;
+function configuredSiteId(graph: MsGraphClient): Promise<string> {
+    if (!configuredSite) {
+        configuredSite = getSiteId(graph).catch((err) => { configuredSite = null; throw err; });
+    }
+    return configuredSite;
+}
+
+/** Resolves the site for a data tool: always the configured site. A composite id for any other site is rejected. */
+async function dataSiteId(graph: MsGraphClient, candidate: unknown): Promise<string> {
+    const allowed = await configuredSiteId(graph);
+    const raw = resolveSiteId(candidate);
+    if (raw.includes(',') && raw !== allowed) {
+        throw new Error(`BLOCKED — nothing was done. These tools only work on the configured Career Coach site (${SP_CONFIG.siteUrl}).`);
+    }
+    return allowed;
+}
+
+/** Strips the app-managed columns (goal lifecycle + manager identity) from an LLM write to UserState. */
+function withoutAppManagedFields(fields: Record<string, unknown>): Record<string, unknown> {
     const out = { ...fields };
-    for (const name of PLAN_LIFECYCLE_FIELDS) {
+    for (const name of APP_MANAGED_USERSTATE_FIELDS) {
         if (name in out) {
             console.warn(`[GoalLifecycle] Ignored LLM write to app-managed column "${name}".`);
             delete out[name];
@@ -248,6 +283,19 @@ function withoutLifecycleFields(fields: Record<string, unknown>): Record<string,
 function currentUserId(rawCtx: any): string {
     const ctx: RunCtx | undefined = rawCtx?.context ?? rawCtx;
     return String(ctx?.turnContext?.activity?.from?.aadObjectId ?? '');
+}
+
+/** The authenticated caller's object id; personal data is never read or written without one. */
+function requireCallerId(rawCtx: any): string {
+    const id = currentUserId(rawCtx);
+    if (!id) {
+        throw new Error('BLOCKED — nothing was done: this turn has no authenticated user, so personal career data can\'t be read or written.');
+    }
+    return id;
+}
+
+function sameId(a: unknown, b: unknown): boolean {
+    return String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
 }
 
 /** Returns the courses / skills this write would advance without a passed quiz. */
@@ -284,28 +332,17 @@ function findUnearnedProgress(
 
 /**
  * Throws (and records the courses for this turn) when an LLM write to UserState would mark
- * a course Complete, record a passed quiz, or raise a skill level. The thrown message is
+ * a course Complete, record a passed quiz, or raise a skill level. `stored` is the row as it is
+ * now (null for a create, which is compared against an empty plan). The thrown message is
  * returned to the model as the tool result.
  */
-async function guardUserStateWrite(
+function guardUserStateWrite(
     rawCtx: any,
-    graph: MsGraphClient,
-    siteId: string,
-    listId: string,
-    itemId: string | undefined,
     displayFields: Record<string, unknown>,
-    colMap: Awaited<ReturnType<typeof getColumnMap>>,
-): Promise<void> {
-    if (!await isUserStateList(graph, siteId, listId)) return;
+    stored: Record<string, unknown> | null,
+): void {
     if (!('LearningProgress' in displayFields) && !('Skills' in displayFields)) return;
 
-    let stored: Record<string, unknown> | null = null;
-    if (itemId) {
-        try {
-            const item = await graph.api(`/sites/${siteId}/lists/${listId}/items/${itemId}?$expand=fields`).get();
-            stored = toDisplayFields(item?.fields ?? {}, colMap);
-        } catch { /* unknown item: compare against an empty plan (strictest) */ }
-    }
     const { courses, skills } = findUnearnedProgress(displayFields, stored);
     if (courses.length === 0 && skills.length === 0) return;
 
@@ -395,8 +432,15 @@ const listListItemsTool: FunctionTool<any, any, any> = makeTool({
     },
     execute: async (args: any, ctx: any) => {
         const graph = graphFrom(ctx);
-        const siteId = resolveSiteId(args.siteId);
+        const siteId = await dataSiteId(graph, args.siteId);
         const listId = resolveListId(siteId, args.listId);
+        const listName = await listNameOf(graph, siteId, listId);
+        if (!careerCoachListNames().includes(listName)) {
+            throw new Error(`BLOCKED — nothing was read. "${args.listId}" is not one of the Career Coach lists (${careerCoachListNames().join(', ')}).`);
+        }
+        // Personal lists: the model only ever sees the caller's own rows, whatever filter it asks for.
+        const personal = personalListNames().includes(listName);
+        const callerId = personal ? requireCallerId(ctx) : '';
         const colMap = await getColumnMap(graph, siteId, listId);
         const rows: Array<{ id: string; fields: any }> = [];
         let url: string | undefined = `/sites/${siteId}/lists/${listId}/items?$expand=fields&$top=200`;
@@ -408,14 +452,14 @@ const listListItemsTool: FunctionTool<any, any, any> = makeTool({
             }
             url = page?.['@odata.nextLink'] ? String(page['@odata.nextLink']).replace('https://graph.microsoft.com/v1.0', '') : undefined;
         }
-        let filtered = rows;
+        let filtered = personal ? rows.filter((r) => sameId(r.fields?.UserAADId, callerId)) : rows;
         if (args.filterField && typeof args.filterValue !== 'undefined') {
             const key = String(args.filterField);
             const needle = String(args.filterValue).toLowerCase();
-            filtered = rows.filter((r) => String(r.fields?.[key] ?? '').toLowerCase() === needle);
+            filtered = filtered.filter((r) => String(r.fields?.[key] ?? '').toLowerCase() === needle);
         }
         // Only the active goal is visible; finished goals are history (see listPreviousGoals).
-        if (await isUserStateList(graph, siteId, listId)) filtered = filtered.filter((r) => planStatusOf(r.fields) === 'Active');
+        if (listName === SP_CONFIG.lists.userState.toLowerCase()) filtered = filtered.filter((r) => planStatusOf(r.fields) === 'Active');
         return JSON.stringify(filtered);
     },
 });
@@ -442,39 +486,51 @@ const createListItemTool: FunctionTool<any, any, any> = makeTool({
     },
     execute: async (args: any, ctx: any) => {
         const graph = graphFrom(ctx);
-        const siteId = resolveSiteId(args.siteId);
+        const siteId = await dataSiteId(graph, args.siteId);
         const listId = resolveListId(siteId, args.listId);
+        // Chat writes are limited to UserState. Reference data, portal completions and quiz audit rows
+        // are written only by provisioning, the learning portal and the deterministic quiz grader.
+        if (!await isUserStateList(graph, siteId, listId)) {
+            throw new Error(`BLOCKED — nothing was written. Writes from chat are limited to the "${SP_CONFIG.lists.userState}" list; every other list is written by the app itself.`);
+        }
+        const callerId = requireCallerId(ctx);
         const colMap = await getColumnMap(graph, siteId, listId);
-        let displayFields = normalizeFields(args.fields);
-        if (await isUserStateList(graph, siteId, listId)) {
+        // Canonical (display) names first, so no guard below can be bypassed with an internal-name alias.
+        let displayFields = canonicalizeFields(normalizeFields(args.fields), colMap);
+        // A new plan always belongs to the authenticated caller; a different owner is refused.
+        if (displayFields.UserAADId !== undefined && String(displayFields.UserAADId).trim() !== '' && !sameId(displayFields.UserAADId, callerId)) {
+            throw new Error('BLOCKED — nothing was written. A plan can only be created for the user you are talking to.');
+        }
+        displayFields = { ...displayFields, UserAADId: callerId };
+
+        return withUserLock(callerId, async () => {
             // One active goal per user: a new row is only allowed when there's no active goal.
-            const userId = String(displayFields.UserAADId ?? currentUserId(ctx));
-            const active = userId ? await readUserState(graph, userId, siteId) : null;
+            const active = await readUserState(graph, callerId, siteId);
             if (active) {
                 throw new Error(
                     `BLOCKED — nothing was written. This user already has an active goal (itemId "${active.itemId}", ` +
                     `TargetRole "${active.state.TargetRole}"). Update that row with updateListItem instead of creating a new one.`,
                 );
             }
-            displayFields = dropMissingLifecycleColumns({ ...withoutLifecycleFields(displayFields), PlanStatus: 'Active' }, colMap);
-        }
-        await guardUserStateWrite(ctx, graph, siteId, listId, undefined, displayFields, colMap);
-        const internalFields = toInternalFields(displayFields, colMap);
-        try {
-            const created = await graph.api(`/sites/${siteId}/lists/${listId}/items`).post({ fields: internalFields });
-            return JSON.stringify({ id: created.id, fields: toDisplayFields(created.fields ?? internalFields, colMap) });
-        } catch (err: any) {
-            const graphBody = err?.body ?? err?.response?.body;
-            const detail = graphBody ? (typeof graphBody === 'string' ? graphBody : JSON.stringify(graphBody)) : '';
-            const statusCode = err?.statusCode ?? err?.code;
-            console.error(`[createListItem] Graph POST failed (status=${statusCode}). Error: ${err?.message}`);
-            console.error(`[createListItem] Display fields sent by LLM:`, JSON.stringify(displayFields, null, 2));
-            console.error(`[createListItem] Internal fields after column-map translation:`, JSON.stringify(internalFields, null, 2));
-            console.error(`[createListItem] Known columns:`, Object.entries(colMap.kindByInternal).map(([k, v]) => `${k}(${v})`).join(', '));
-            console.error(`[createListItem] Display->internal map:`, JSON.stringify(colMap.displayToInternal));
-            if (detail) console.error(`[createListItem] Graph error body:`, detail);
-            throw new Error(`createListItem failed: ${err?.message ?? 'unknown'} — Graph body: ${detail || '(none)'}`);
-        }
+            displayFields = dropMissingLifecycleColumns({ ...withoutAppManagedFields(displayFields), PlanStatus: 'Active' }, colMap);
+            guardUserStateWrite(ctx, displayFields, null);
+            const internalFields = toInternalFields(displayFields, colMap);
+            try {
+                const created = await graph.api(`/sites/${siteId}/lists/${listId}/items`).post({ fields: internalFields });
+                return JSON.stringify({ id: created.id, fields: toDisplayFields(created.fields ?? internalFields, colMap) });
+            } catch (err: any) {
+                const graphBody = err?.body ?? err?.response?.body;
+                const detail = graphBody ? (typeof graphBody === 'string' ? graphBody : JSON.stringify(graphBody)) : '';
+                const statusCode = err?.statusCode ?? err?.code;
+                console.error(`[createListItem] Graph POST failed (status=${statusCode}). Error: ${err?.message}`);
+                console.error(`[createListItem] Display fields sent by LLM:`, JSON.stringify(displayFields, null, 2));
+                console.error(`[createListItem] Internal fields after column-map translation:`, JSON.stringify(internalFields, null, 2));
+                console.error(`[createListItem] Known columns:`, Object.entries(colMap.kindByInternal).map(([k, v]) => `${k}(${v})`).join(', '));
+                console.error(`[createListItem] Display->internal map:`, JSON.stringify(colMap.displayToInternal));
+                if (detail) console.error(`[createListItem] Graph error body:`, detail);
+                throw new Error(`createListItem failed: ${err?.message ?? 'unknown'} — Graph body: ${detail || '(none)'}`);
+            }
+        });
     },
 });
 
@@ -501,51 +557,73 @@ const updateListItemTool: FunctionTool<any, any, any> = makeTool({
     },
     execute: async (args: any, ctx: any) => {
         const graph = graphFrom(ctx);
-        const siteId = resolveSiteId(args.siteId);
+        const siteId = await dataSiteId(graph, args.siteId);
         const listId = resolveListId(siteId, args.listId);
+        if (!await isUserStateList(graph, siteId, listId)) {
+            throw new Error(`BLOCKED — nothing was written. Writes from chat are limited to the "${SP_CONFIG.lists.userState}" list; every other list is written by the app itself.`);
+        }
+        const callerId = requireCallerId(ctx);
+        const itemId = String(args.itemId ?? '').trim();
+        if (!/^\d+$/.test(itemId)) {
+            throw new Error('BLOCKED — nothing was written. itemId must be the numeric id of a row returned by listListItems.');
+        }
         const colMap = await getColumnMap(graph, siteId, listId);
-        let displayFields = normalizeFields(args.fields);
-        if (await isUserStateList(graph, siteId, listId)) {
-            displayFields = withoutLifecycleFields(displayFields);
-            let stored: Record<string, any> | null = null;
+        // Canonical (display) names first, so no guard below can be bypassed with an internal-name alias.
+        let displayFields = canonicalizeFields(normalizeFields(args.fields), colMap);
+
+        return withUserLock(callerId, async () => {
+            // Fail closed: a row that can't be read, or that belongs to someone else, is never written.
+            let stored: Record<string, any>;
             try {
-                const item = await graph.api(`/sites/${siteId}/lists/${listId}/items/${args.itemId}?$expand=fields`).get();
+                const item = await graph.api(`/sites/${siteId}/lists/${listId}/items/${itemId}?$expand=fields`).get();
                 stored = toDisplayFields(item?.fields ?? {}, colMap);
-            } catch { /* unknown item: Graph reports it on the update below */ }
-            const status = stored ? planStatusOf(stored) : 'Active';
+            } catch (err: any) {
+                throw new Error(`BLOCKED — nothing was written. Item "${itemId}" could not be read (${err?.statusCode ?? err?.code ?? 'error'}), so ownership can't be verified. Re-read the active goal with listListItems and retry.`);
+            }
+            if (!sameId(stored.UserAADId, callerId)) {
+                throw new Error(`BLOCKED — nothing was written. Item "${itemId}" is not the current user's plan.`);
+            }
+            // Ownership never changes.
+            if (displayFields.UserAADId !== undefined && !sameId(displayFields.UserAADId, callerId)) {
+                throw new Error('BLOCKED — nothing was written. The owner of a plan cannot be changed.');
+            }
+            delete displayFields.UserAADId;
+            displayFields = withoutAppManagedFields(displayFields);
+
+            const status = planStatusOf(stored);
             if (status !== 'Active') {
                 throw new Error(
-                    `BLOCKED — nothing was written. Item "${args.itemId}" is a ${status.toLowerCase()} goal and is read-only history. ` +
+                    `BLOCKED — nothing was written. Item "${itemId}" is a ${status.toLowerCase()} goal and is read-only history. ` +
                     `Only the user's active goal (from listListItems) can be updated.`,
                 );
             }
             // Switching the active goal to another role must not wipe its progress.
             const newRole = String(displayFields.TargetRole ?? '').trim().toLowerCase();
-            const oldRole = String(stored?.TargetRole ?? '').trim().toLowerCase();
-            const hasProgress = Number(stored?.OverallProgress ?? 0) > 0 ||
-                parseJsonArray(stored?.LearningProgress).some((lp) => String(lp?.status ?? 'Recommended') !== 'Recommended' || !!lp?.quizResult);
+            const oldRole = String(stored.TargetRole ?? '').trim().toLowerCase();
+            const hasProgress = Number(stored.OverallProgress ?? 0) > 0 ||
+                parseJsonArray(stored.LearningProgress).some((lp) => String(lp?.status ?? 'Recommended') !== 'Recommended' || !!lp?.quizResult);
             if (newRole && oldRole && newRole !== oldRole && hasProgress) {
                 throw new Error(
-                    `BLOCKED — nothing was written. The active "${stored?.TargetRole}" goal has progress and can't be overwritten with a new role. ` +
+                    `BLOCKED — nothing was written. The active "${stored.TargetRole}" goal has progress and can't be overwritten with a new role. ` +
                     `Ask the user to click 💾 Save my plan on the plan card — the app keeps the unfinished goal as history and starts the new one.`,
                 );
             }
-        }
-        await guardUserStateWrite(ctx, graph, siteId, listId, String(args.itemId ?? ''), displayFields, colMap);
-        const internalFields = toInternalFields(displayFields, colMap);
-        try {
-            const updated = await graph.api(`/sites/${siteId}/lists/${listId}/items/${args.itemId}/fields`).update(internalFields);
-            return JSON.stringify({ id: args.itemId, fields: toDisplayFields(updated ?? internalFields, colMap) });
-        } catch (err: any) {
-            const graphBody = err?.body ?? err?.response?.body;
-            const detail = graphBody ? (typeof graphBody === 'string' ? graphBody : JSON.stringify(graphBody)) : '';
-            const statusCode = err?.statusCode ?? err?.code;
-            console.error(`[updateListItem] Graph PATCH failed (status=${statusCode}). Error: ${err?.message}`);
-            console.error(`[updateListItem] Display fields sent by LLM:`, JSON.stringify(displayFields, null, 2));
-            console.error(`[updateListItem] Internal fields after column-map translation:`, JSON.stringify(internalFields, null, 2));
-            if (detail) console.error(`[updateListItem] Graph error body:`, detail);
-            throw new Error(`updateListItem failed: ${err?.message ?? 'unknown'} — Graph body: ${detail || '(none)'}`);
-        }
+            guardUserStateWrite(ctx, displayFields, stored);
+            const internalFields = toInternalFields(displayFields, colMap);
+            try {
+                const updated = await graph.api(`/sites/${siteId}/lists/${listId}/items/${itemId}/fields`).update(internalFields);
+                return JSON.stringify({ id: itemId, fields: toDisplayFields(updated ?? internalFields, colMap) });
+            } catch (err: any) {
+                const graphBody = err?.body ?? err?.response?.body;
+                const detail = graphBody ? (typeof graphBody === 'string' ? graphBody : JSON.stringify(graphBody)) : '';
+                const statusCode = err?.statusCode ?? err?.code;
+                console.error(`[updateListItem] Graph PATCH failed (status=${statusCode}). Error: ${err?.message}`);
+                console.error(`[updateListItem] Display fields sent by LLM:`, JSON.stringify(displayFields, null, 2));
+                console.error(`[updateListItem] Internal fields after column-map translation:`, JSON.stringify(internalFields, null, 2));
+                if (detail) console.error(`[updateListItem] Graph error body:`, detail);
+                throw new Error(`updateListItem failed: ${err?.message ?? 'unknown'} — Graph body: ${detail || '(none)'}`);
+            }
+        });
     },
 });
 

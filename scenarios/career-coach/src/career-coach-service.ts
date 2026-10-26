@@ -49,16 +49,16 @@ async function pagedItems(graph: MsGraphClient, siteId: string, listId: string):
 }
 
 export async function readCompetencyFramework(graph: MsGraphClient, siteId?: string): Promise<CompetencyFrameworkRow[]> {
-    const site = siteId ?? await getSiteId();
-    const listId = await getListIdByName(site, SP_CONFIG.lists.competencyFramework);
+    const site = siteId ?? await getSiteId(graph);
+    const listId = await getListIdByName(site, SP_CONFIG.lists.competencyFramework, graph);
     if (!listId) throw new Error(`List not found: ${SP_CONFIG.lists.competencyFramework}`);
     const items = await pagedItems(graph, site, listId);
     return items.map((r) => r.fields as unknown as CompetencyFrameworkRow);
 }
 
 export async function readLearningCatalog(graph: MsGraphClient, siteId?: string): Promise<LearningCatalogRow[]> {
-    const site = siteId ?? await getSiteId();
-    const listId = await getListIdByName(site, SP_CONFIG.lists.learningCatalog);
+    const site = siteId ?? await getSiteId(graph);
+    const listId = await getListIdByName(site, SP_CONFIG.lists.learningCatalog, graph);
     if (!listId) throw new Error(`List not found: ${SP_CONFIG.lists.learningCatalog}`);
     const items = await pagedItems(graph, site, listId);
     return items.map((r) => r.fields as unknown as LearningCatalogRow);
@@ -88,8 +88,8 @@ export async function readPreviousPlans(graph: MsGraphClient, userAADId: string,
 }
 
 async function readUserRows(graph: MsGraphClient, userAADId: string, siteId?: string) {
-    const site = siteId ?? await getSiteId();
-    const listId = await getListIdByName(site, SP_CONFIG.lists.userState);
+    const site = siteId ?? await getSiteId(graph);
+    const listId = await getListIdByName(site, SP_CONFIG.lists.userState, graph);
     if (!listId) throw new Error(`List not found: ${SP_CONFIG.lists.userState}`);
     const items = await pagedItems(graph, site, listId);
     const rows = items.filter((r) => String(r.fields?.UserAADId ?? '').toLowerCase() === userAADId.toLowerCase());
@@ -97,8 +97,8 @@ async function readUserRows(graph: MsGraphClient, userAADId: string, siteId?: st
 }
 
 export async function readLearningPortalStatus(graph: MsGraphClient, userAADId: string, siteId?: string): Promise<LearningPortalStatusRow[]> {
-    const site = siteId ?? await getSiteId();
-    const listId = await getListIdByName(site, SP_CONFIG.lists.learningPortalStatus);
+    const site = siteId ?? await getSiteId(graph);
+    const listId = await getListIdByName(site, SP_CONFIG.lists.learningPortalStatus, graph);
     if (!listId) return [];
     const items = await pagedItems(graph, site, listId);
     return items
@@ -199,12 +199,13 @@ export function dropMissingLifecycleColumns(fields: Record<string, unknown>, col
 // ============================================================================
 
 export async function upsertUserState(graph: MsGraphClient, state: UserState, existing?: UserStateRecord): Promise<UserStateRecord> {
-    const site = existing?.siteId ?? await getSiteId();
-    const listId = existing?.listId ?? await getListIdByName(site, SP_CONFIG.lists.userState);
+    const site = existing?.siteId ?? await getSiteId(graph);
+    const listId = existing?.listId ?? await getListIdByName(site, SP_CONFIG.lists.userState, graph);
     if (!listId) throw new Error(`List not found: ${SP_CONFIG.lists.userState}`);
     const colMap = await getColumnMap(graph, site, listId);
     const displayFields = dropMissingLifecycleColumns(serializeUserState(state), colMap);
-    const internal = toInternalFields(displayFields, colMap);
+    // Updates preserve intentional clears (e.g. reopening a goal blanks PlanCompletedDate); creates never send them.
+    const internal = toInternalFields(displayFields, colMap, { preserveClears: !!existing?.itemId });
     if (existing?.itemId) {
         await graph.api(`/sites/${site}/lists/${listId}/items/${existing.itemId}/fields`).update(internal);
         return { itemId: existing.itemId, siteId: site, listId, state };
@@ -224,8 +225,8 @@ export async function appendQuizResponse(graph: MsGraphClient, row: {
     attempts: number;
     feedback: any[];
 }, siteId?: string): Promise<void> {
-    const site = siteId ?? await getSiteId();
-    const listId = await getListIdByName(site, SP_CONFIG.lists.quizResponses);
+    const site = siteId ?? await getSiteId(graph);
+    const listId = await getListIdByName(site, SP_CONFIG.lists.quizResponses, graph);
     if (!listId) throw new Error(`List not found: ${SP_CONFIG.lists.quizResponses}`);
     const colMap = await getColumnMap(graph, site, listId);
     const displayFields: Record<string, unknown> = {
@@ -559,8 +560,8 @@ export function computeMilestoneAggregate(
 }
 
 export async function readAllQuizResponsesForUser(graph: MsGraphClient, userAADId: string, siteId?: string): Promise<Array<{ QuestionsJSON: string }>> {
-    const site = siteId ?? await getSiteId();
-    const listId = await getListIdByName(site, SP_CONFIG.lists.quizResponses);
+    const site = siteId ?? await getSiteId(graph);
+    const listId = await getListIdByName(site, SP_CONFIG.lists.quizResponses, graph);
     if (!listId) return [];
     const items = await pagedItems(graph, site, listId);
     return items

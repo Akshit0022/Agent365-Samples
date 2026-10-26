@@ -213,12 +213,14 @@ export function getAgenticGraphClient(turnContext: TurnContext, authorization: A
 
 /**
  * Resolves the SharePoint site id for the CareerCoach site (from SP_SITE_HOST + SP_SITE_PATH).
+ * Runtime code passes the agentic Graph client; with no client it falls back to the developer's
+ * device-code client, which is only meant for scripts and developer-authenticated background work.
  */
-export async function getSiteId(): Promise<string> {
+export async function getSiteId(graph?: MsGraphClient): Promise<string> {
     const host = process.env.SP_SITE_HOST || 'contoso.sharepoint.com';
     const sitePath = (process.env.SP_SITE_PATH || '/sites/CareerCoach').replace(/^\//, '');
-    const graph = getGraphClient();
-    const site = await graph.api(`/sites/${host}:/${sitePath}`).get();
+    const g = graph ?? getGraphClient();
+    const site = await g.api(`/sites/${host}:/${sitePath}`).get();
     return site.id as string;
 }
 // -----------------------------------------------------------------------------
@@ -319,8 +321,8 @@ export async function sendMail({ to, cc, subject, htmlBody, fromUserId, graph }:
 // agent DMs the user" real-time trigger, without Power Automate.
 // -----------------------------------------------------------------------------
 
-export async function getListIdByName(siteId: string, listDisplayName: string): Promise<string | null> {
-    const graph = getGraphClient();
+export async function getListIdByName(siteId: string, listDisplayName: string, graphClient?: MsGraphClient): Promise<string | null> {
+    const graph = graphClient ?? getGraphClient();
     const escaped = listDisplayName.replace(/'/g, "''");
     const res = await graph
         .api(`/sites/${siteId}/lists?$filter=displayName eq '${escaped}'`)

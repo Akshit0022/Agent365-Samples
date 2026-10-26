@@ -35,6 +35,32 @@ export function putQuiz(userAADId: string, courseId: string, questions: QuizQues
     });
 }
 
+// One generation per user/course at a time: overlapping sync / portal turns that both find the cache
+// empty must share a single set of questions, or the first card sent would be graded against the
+// second card's answer key.
+const generating = new Map<string, Promise<QuizQuestionWithKey[]>>();
+
+export async function getOrCreateQuiz(
+    userAADId: string,
+    courseId: string,
+    generate: () => Promise<QuizQuestionWithKey[]>,
+): Promise<QuizQuestionWithKey[]> {
+    const cached = getQuiz(userAADId, courseId);
+    if (cached && cached.length > 0) return cached;
+    const key = keyOf(userAADId, courseId);
+    let pendingGeneration = generating.get(key);
+    if (!pendingGeneration) {
+        pendingGeneration = generate()
+            .then((questions) => {
+                putQuiz(userAADId, courseId, questions);
+                return questions;
+            })
+            .finally(() => generating.delete(key));
+        generating.set(key, pendingGeneration);
+    }
+    return pendingGeneration;
+}
+
 export function getQuiz(userAADId: string, courseId: string): QuizQuestionWithKey[] | null {
     const key = keyOf(userAADId, courseId);
     const entry = cache.get(key);

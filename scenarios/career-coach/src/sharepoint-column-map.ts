@@ -21,6 +21,8 @@ interface ColumnMap {
     internalToDisplay: Record<string, string>;
     /** Column kind keyed by internal name — used to auto-format hyperlink values, etc. */
     kindByInternal: Record<string, ColumnKind>;
+    /** Internal names of columns SharePoint flags as required — these can never be cleared. */
+    requiredInternal: Set<string>;
 }
 
 const cache = new Map<string, ColumnMap>();
@@ -58,6 +60,7 @@ export async function getColumnMap(graph: MsGraphClient, siteId: string, listId:
     const displayToInternal: Record<string, string> = {};
     const internalToDisplay: Record<string, string> = {};
     const kindByInternal: Record<string, ColumnKind> = {};
+    const requiredInternal = new Set<string>();
 
     // System columns we always ignore — they're SP-managed metadata (Compliance Asset id,
     // ColorTag, LinkTitle, Attachments, etc.) that leak into every list.
@@ -77,11 +80,35 @@ export async function getColumnMap(graph: MsGraphClient, siteId: string, listId:
         if (!displayToInternal[disp]) displayToInternal[disp] = c.name;
         internalToDisplay[c.name] = disp;
         kindByInternal[c.name] = detectKind(c);
+        if (c.required === true) requiredInternal.add(c.name);
     }
 
-    const map: ColumnMap = { displayToInternal, internalToDisplay, kindByInternal };
+    const map: ColumnMap = { displayToInternal, internalToDisplay, kindByInternal, requiredInternal };
     cache.set(k, map);
     return map;
+}
+
+/**
+ * Rewrites a model-supplied fields object so every key is the column's DISPLAY name, matched
+ * case-insensitively against both display and internal names (imported lists expose `field_N`
+ * internal names). Every write guard inspects display names, so this must run before them —
+ * otherwise `field_5` or `learningprogress` would reach SharePoint unchecked. Throws when two keys
+ * address the same column (conflicting aliases). Unknown keys pass through for Graph to reject.
+ */
+export function canonicalizeFields(fields: Record<string, unknown>, map: ColumnMap): Record<string, unknown> {
+    const byLower = new Map<string, string>();
+    for (const display of Object.keys(map.displayToInternal)) byLower.set(display.toLowerCase(), display);
+    for (const [internal, display] of Object.entries(map.internalToDisplay)) byLower.set(internal.toLowerCase(), display);
+
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(fields)) {
+        const canonical = byLower.get(key.toLowerCase()) ?? key;
+        if (canonical in out) {
+            throw new Error(`BLOCKED — nothing was written. Fields "${key}" and another key both address the column "${canonical}". Send each column once, using its display name.`);
+        }
+        out[canonical] = value;
+    }
+    return out;
 }
 
 /**
@@ -93,7 +120,9 @@ export async function getColumnMap(graph: MsGraphClient, siteId: string, listId:
  * Defensive coercions applied for LLM output:
  *  - null / undefined / empty-string values are DROPPED. SharePoint's imported columns
  *    are often flagged Required; sending "" causes generalException even when the LLM
- *    means "unknown".
+ *    means "unknown". Trusted app writes (updates only) pass `preserveClears` so an
+ *    intentional clear — e.g. reopening a goal blanks PlanCompletedDate — is sent as
+ *    `null`; required columns are still never cleared.
  *  - Arrays / plain objects going to non-hyperlink columns are JSON.stringify'd so
  *    SharePoint's multi-line text columns accept them. The LLM sometimes forgets to
  *    stringify Goals/Skills/LearningProgress and sends raw arrays.
@@ -108,12 +137,24 @@ const READONLY_INTERNAL = new Set([
     '_IsRecord',
 ]);
 
-export function toInternalFields(fields: Record<string, unknown>, map: ColumnMap): Record<string, unknown> {
+export function toInternalFields(
+    fields: Record<string, unknown>,
+    map: ColumnMap,
+    options: { preserveClears?: boolean } = {},
+): Record<string, unknown> {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(fields)) {
-        // Drop null / undefined / empty-string.
-        if (v === null || typeof v === 'undefined') continue;
-        if (typeof v === 'string' && v.length === 0) continue;
+        // Omitted (undefined) values are never sent.
+        if (typeof v === 'undefined') continue;
+        const isClear = v === null || (typeof v === 'string' && v.length === 0);
+        if (isClear) {
+            // Explicit clear: only trusted app updates may send it, only to a known, non-required column.
+            const target = map.displayToInternal[k] ?? k;
+            if (options.preserveClears && target in map.kindByInternal && !map.requiredInternal.has(target) && !READONLY_INTERNAL.has(target)) {
+                out[target] = null;
+            }
+            continue;
+        }
 
         const internal = map.displayToInternal[k] ?? k;
 
