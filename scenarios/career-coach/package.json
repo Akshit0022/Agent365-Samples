@@ -21,7 +21,7 @@
   "license": "MIT",
   "description": "Career Coach autopilot — an Agent 365 scenario sample (Node.js) that helps employees set goals, close skill gaps, and prepare for career conversations inside Microsoft Teams.",
   "dependencies": {
-    "@azure/msal-node": "^5.4.0",
+    "@azure/msal-node": "^7.1.1",
     "@microsoft/agents-a365-notifications": "^2.0.0",
     "@microsoft/agents-a365-runtime": "^2.0.0",
     "@microsoft/agents-a365-tooling": "^2.0.0",
